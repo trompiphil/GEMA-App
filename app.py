@@ -12,19 +12,16 @@ DB_NAME = "GEMA_Datenbank"
 # --- SETUP & VERBINDUNG ---
 st.set_page_config(page_title="GEMA Manager", page_icon="xj", layout="centered")
 
-# INITIALISIERUNG DES GEDÄCHTNISSES (SESSION STATE)
-# Wir legen Container an, die auch beim Neuladen bestehen bleiben
+# INITIALISIERUNG DES GEDÄCHTNISSES
 if 'gig_draft' not in st.session_state:
     st.session_state.gig_draft = {
+        "event_id": None,           # Wenn nicht None, sind wir im Editier-Modus
         "datum": datetime.date.today(),
         "uhrzeit": datetime.time(19, 0),
         "ensemble": "Tutti",
-        "location_selection": None, # Was im Dropdown gewählt wurde
-        "new_loc_name": "",         # Falls neuer Ort: Name
-        "new_loc_str": "",          # Falls neuer Ort: Straße
-        "new_loc_plz": "",
-        "new_loc_stadt": "",
-        "selected_songs": []        # Die Liste der Lieder
+        "location_selection": "Bitte wählen...", 
+        "new_loc_data": {},         # Hier landen die Daten aus dem Formular
+        "selected_songs": []
     }
 
 if 'page' not in st.session_state:
@@ -32,10 +29,7 @@ if 'page' not in st.session_state:
 
 @st.cache_resource
 def get_gspread_client():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     s_info = st.secrets["gcp_service_account"]
     creds = Credentials.from_service_account_info(s_info, scopes=scopes)
     client = gspread.authorize(creds)
@@ -52,24 +46,21 @@ except Exception as e:
 # --- DB FUNKTIONEN ---
 
 def check_and_fix_db():
-    # 1. Repertoire
     try: ws_rep = sh.worksheet("Repertoire")
     except: ws_rep = sh.add_worksheet(title="Repertoire", rows=100, cols=15)
-    
     rep_headers = ['ID', 'Titel', 'Komponist_Nachname', 'Komponist_Vorname', 
                    'Bearbeiter_Nachname', 'Bearbeiter_Vorname', 'Dauer', 'Verlag', 'Werkeart', 'ISWC']
     curr_rep = ws_rep.row_values(1)
     if not curr_rep or curr_rep[0] != 'ID': ws_rep.update('A1:J1', [rep_headers])
 
-    # 2. Events
     try: ws_ev = sh.worksheet("Events")
     except: ws_ev = sh.add_worksheet(title="Events", rows=100, cols=15)
     event_headers = ['Event_ID', 'Datum', 'Uhrzeit', 'Ensemble', 'Location_Name', 
                      'Strasse', 'PLZ', 'Stadt', 'Setlist_Name', 'Songs_IDs']
-    if not ws_ev.row_values(1) or 'Uhrzeit' not in ws_ev.row_values(1):
+    curr_ev = ws_ev.row_values(1)
+    if not curr_ev or 'Uhrzeit' not in curr_ev:
         ws_ev.clear(); ws_ev.update('A1:J1', [event_headers])
 
-    # 3. Locations
     try: ws_loc = sh.worksheet("Locations")
     except: ws_loc = sh.add_worksheet(title="Locations", rows=50, cols=5)
     loc_headers = ['ID', 'Name', 'Strasse', 'PLZ', 'Stadt']
@@ -100,7 +91,6 @@ def load_events():
     return df
 
 def save_song_direct(titel, kn, kv, bn, bv, dauer, verlag):
-    """Speichert Song und gibt True zurück, ohne Rerun zu erzwingen (macht die App)"""
     try:
         ws = sh.worksheet("Repertoire")
         col_ids = ws.col_values(1)[1:] 
@@ -109,8 +99,7 @@ def save_song_direct(titel, kn, kv, bn, bv, dauer, verlag):
         row = [new_id, titel, kn, kv, bn, bv, dauer, verlag, "U-Musik", ""]
         ws.append_row(row)
         return True
-    except Exception as e:
-        return False
+    except: return False
 
 def save_location_direct(name, strasse, plz, stadt):
     ws = sh.worksheet("Locations")
@@ -120,12 +109,27 @@ def save_location_direct(name, strasse, plz, stadt):
     ws.append_row([new_id, name, strasse, plz, stadt])
     return True
 
+def update_event_in_db(event_id, row_data):
+    """Aktualisiert eine existierende Zeile in Events"""
+    ws = sh.worksheet("Events")
+    try:
+        cell = ws.find(str(event_id), in_column=1)
+        row_num = cell.row
+        # Wir überschreiben die ganze Zeile (außer ID an pos 0)
+        # row_data kommt ohne ID, also Event_ID, Datum, Uhrzeit...
+        # range ist B{row}:J{row}
+        ws.update(f"A{row_num}:J{row_num}", [[event_id] + row_data])
+        return True
+    except Exception as e:
+        st.error(f"Fehler beim Update: {e}")
+        return False
+
 # --- NAVIGATION ---
 
 def navigation_bar():
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
-    if c1.button("💾 Auftritt speichern", use_container_width=True, type="primary" if st.session_state.page == "speichern" else "secondary"):
+    if c1.button("💾 Speichern / Edit", use_container_width=True, type="primary" if st.session_state.page == "speichern" else "secondary"):
         st.session_state.page = "speichern"; st.rerun()
     if c2.button("🎵 Repertoire", use_container_width=True, type="primary" if st.session_state.page == "repertoire" else "secondary"):
         st.session_state.page = "repertoire"; st.rerun()
@@ -142,18 +146,74 @@ st.title("Orchester Manager 🎻")
 navigation_bar()
 
 # ==========================================
-# SEITE 1: AUFTRITT SPEICHERN (OPTIMIERT)
+# SEITE 1: AUFTRITT SPEICHERN & EDITIEREN
 # ==========================================
 if st.session_state.page == "speichern":
-    st.subheader("Vergangenen Auftritt erfassen")
     
-    # Daten laden
+    # DATEN LADEN
     df_loc = load_locations()
     df_rep = load_repertoire()
+    df_events = load_events()
     
+    # --- EDITIER-FUNKTION ---
+    with st.expander("🛠 Bereits gespeicherten Auftritt bearbeiten", expanded=False):
+        if not df_events.empty:
+            # Dropdown Label bauen
+            df_events['Label'] = df_events.apply(lambda x: f"{x['Datum']} - {x['Location_Name']} ({x['Ensemble']})", axis=1)
+            # Sortieren nach Datum neu -> alt
+            df_events = df_events.sort_values(by='Datum_Obj', ascending=False)
+            
+            edit_options = ["Neuen Auftritt erfassen"] + df_events['Label'].tolist()
+            edit_selection = st.selectbox("Wähle einen Auftritt zum Bearbeiten:", edit_options)
+            
+            if st.button("Diesen Auftritt laden"):
+                if edit_selection != "Neuen Auftritt erfassen":
+                    # Daten aus DB holen und in Session State schreiben
+                    row = df_events[df_events['Label'] == edit_selection].iloc[0]
+                    
+                    st.session_state.gig_draft["event_id"] = row['Event_ID']
+                    st.session_state.gig_draft["datum"] = datetime.datetime.strptime(row['Datum'], "%d.%m.%Y").date()
+                    try:
+                        st.session_state.gig_draft["uhrzeit"] = datetime.datetime.strptime(row['Uhrzeit'], "%H:%M").time()
+                    except:
+                        st.session_state.gig_draft["uhrzeit"] = datetime.time(19, 0)
+                        
+                    st.session_state.gig_draft["ensemble"] = row['Ensemble']
+                    st.session_state.gig_draft["location_selection"] = row['Location_Name']
+                    
+                    # Song IDs wieder in Labels wandeln
+                    saved_ids = str(row['Songs_IDs']).split(",")
+                    restored_labels = []
+                    if not df_rep.empty:
+                        # Hilfs-Map ID -> Label
+                        df_rep['Label'] = df_rep.apply(lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})", axis=1)
+                        id_to_label = dict(zip(df_rep['ID'].astype(str), df_rep['Label']))
+                        
+                        for sid in saved_ids:
+                            if sid in id_to_label:
+                                restored_labels.append(id_to_label[sid])
+                                
+                    st.session_state.gig_draft["selected_songs"] = restored_labels
+                    st.toast("Auftritt geladen! Jetzt bearbeiten und speichern.", icon="✏️")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    # Reset auf Leer
+                    st.session_state.gig_draft["event_id"] = None
+                    st.session_state.gig_draft["selected_songs"] = []
+                    st.toast("Reset auf 'Neu'", icon="🆕")
+                    time.sleep(0.5)
+                    st.rerun()
+        else:
+            st.info("Keine gespeicherten Auftritte gefunden.")
+
+    # --- ÜBERSCHRIFT ---
+    if st.session_state.gig_draft["event_id"]:
+        st.header(f"✏️ Auftritt bearbeiten (ID: {st.session_state.gig_draft['event_id']})")
+    else:
+        st.header("📝 Neuen Auftritt erfassen")
+
     # --- RAHMENDATEN ---
-    # Wir nutzen st.columns und speichern Änderungen SOFORT in session_state
-    
     c_date, c_time = st.columns(2)
     st.session_state.gig_draft["datum"] = c_date.date_input("Datum", value=st.session_state.gig_draft["datum"])
     st.session_state.gig_draft["uhrzeit"] = c_time.time_input("Uhrzeit", value=st.session_state.gig_draft["uhrzeit"])
@@ -161,58 +221,54 @@ if st.session_state.page == "speichern":
     st.session_state.gig_draft["ensemble"] = st.selectbox("Ensemble", ["Tutti", "BQ", "Quartett", "Duo"], 
                                                           index=["Tutti", "BQ", "Quartett", "Duo"].index(st.session_state.gig_draft["ensemble"]))
 
-    # --- LOCATION LOGIK (Hybrid) ---
+    # --- LOCATION LOGIK ---
     st.write("📍 **Spielort**")
-    
-    # Liste bauen: Vorhandene Orte + Option "NEU"
     loc_options = ["Bitte wählen..."] + df_loc['Name'].tolist() + ["➕ Neuer Ort..."]
     
-    # Versuchen, den alten Wert wiederzufinden (Index)
-    try:
-        sel_idx = loc_options.index(st.session_state.gig_draft["location_selection"])
-    except:
-        sel_idx = 0
+    # Index finden
+    try: sel_idx = loc_options.index(st.session_state.gig_draft["location_selection"])
+    except: sel_idx = 0
         
-    selected_loc = st.selectbox("Ort suchen (tippen zum Filtern) oder neu anlegen:", 
-                                options=loc_options, 
-                                index=sel_idx)
-    
-    # Auswahl ins Gedächtnis schreiben
+    selected_loc = st.selectbox("Ort:", options=loc_options, index=sel_idx)
     st.session_state.gig_draft["location_selection"] = selected_loc
 
-    # Falls "Neuer Ort" gewählt wurde -> Eingabefelder zeigen
-    final_loc_data = {} # Hier speichern wir am Ende die validen Daten für den Gig
+    final_loc_data = {}
     
     if selected_loc == "➕ Neuer Ort...":
-        with st.container(border=True):
-            st.info("Bitte Adresse für den neuen Ort eingeben (wird gespeichert):")
-            st.session_state.gig_draft["new_loc_name"] = st.text_input("Name der Location*", value=st.session_state.gig_draft["new_loc_name"])
-            st.session_state.gig_draft["new_loc_str"] = st.text_input("Straße & Nr", value=st.session_state.gig_draft["new_loc_str"])
+        # FORMULAR GEGEN RELOADS
+        st.info("Bitte Adresse eingeben und bestätigen:")
+        with st.form("new_loc_form"):
+            nl_name = st.text_input("Name der Location*")
+            nl_str = st.text_input("Straße & Nr")
             c_plz, c_stadt = st.columns([1, 2])
-            st.session_state.gig_draft["new_loc_plz"] = c_plz.text_input("PLZ", value=st.session_state.gig_draft["new_loc_plz"])
-            st.session_state.gig_draft["new_loc_stadt"] = c_stadt.text_input("Stadt*", value=st.session_state.gig_draft["new_loc_stadt"])
+            nl_plz = c_plz.text_input("PLZ")
+            nl_stadt = c_stadt.text_input("Stadt*")
             
-            # Daten für Speicherung vorbereiten
-            final_loc_data = {
-                "Name": st.session_state.gig_draft["new_loc_name"],
-                "Strasse": st.session_state.gig_draft["new_loc_str"],
-                "PLZ": st.session_state.gig_draft["new_loc_plz"],
-                "Stadt": st.session_state.gig_draft["new_loc_stadt"]
-            }
+            if st.form_submit_button("Adresse bestätigen"):
+                st.session_state.gig_draft["new_loc_data"] = {
+                    "Name": nl_name, "Strasse": nl_str, "PLZ": nl_plz, "Stadt": nl_stadt
+                }
+                st.success("Adresse übernommen!")
+                # KEIN Rerun hier nötig, User sieht den Erfolg und macht weiter
+        
+        # Prüfen ob Daten da sind
+        if st.session_state.gig_draft["new_loc_data"]:
+            d = st.session_state.gig_draft["new_loc_data"]
+            st.caption(f"✅ Vorgemerkt: {d.get('Name')}, {d.get('Stadt')}")
+            final_loc_data = d
+            
     elif selected_loc != "Bitte wählen...":
-        # Bestehenden Ort nutzen
         row = df_loc[df_loc['Name'] == selected_loc].iloc[0]
         final_loc_data = row.to_dict()
-        st.caption(f"Adresse: {final_loc_data['Strasse']}, {final_loc_data['PLZ']} {final_loc_data['Stadt']}")
+        st.caption(f"Adresse: {final_loc_data['Strasse']}, {final_loc_data['Stadt']}")
 
     st.markdown("---")
 
-    # --- SONG AUSWAHL & SCHNELL-ANLAGE ---
-    
+    # --- SONG AUSWAHL ---
     st.write("🎵 **Programm**")
     
-    # 1. INLINE SCHNELL-ANLAGE (Der Gamechanger)
-    with st.expander("➕ Titel fehlt? Hier sofort anlegen (ohne Seitenwechsel)"):
+    # SCHNELL-ANLAGE (Erweitert)
+    with st.expander("➕ Titel fehlt? Hier sofort anlegen"):
         with st.form("quick_add_song"):
             qc1, qc2 = st.columns([3, 1])
             q_tit = qc1.text_input("Titel")
@@ -220,42 +276,41 @@ if st.session_state.page == "speichern":
             qc3, qc4 = st.columns(2)
             q_kn = qc3.text_input("Komponist NN")
             q_kv = qc4.text_input("Komponist VN")
+            
+            # NEU: Bearbeiter
+            qc5, qc6 = st.columns(2)
+            q_bn = qc5.text_input("Bearbeiter NN")
+            q_bv = qc6.text_input("Bearbeiter VN")
+            
             q_ver = st.text_input("Verlag")
             
             if st.form_submit_button("Schnell speichern"):
                 if q_tit and q_kn:
-                    save_song_direct(q_tit, q_kn, q_kv, "", "", q_dur, q_ver)
-                    st.toast(f"'{q_tit}' hinzugefügt! Ist jetzt unten verfügbar.", icon="✅")
+                    save_song_direct(q_tit, q_kn, q_kv, q_bn, q_bv, q_dur, q_ver)
+                    st.toast(f"'{q_tit}' hinzugefügt!", icon="✅")
                     time.sleep(1)
-                    st.rerun() # Seite neu laden -> DB lädt neu -> Song ist da!
+                    st.rerun()
                 else:
                     st.error("Titel & Komponist Pflicht.")
 
-    # 2. SELEKTION
+    # MULTISELECT
     if not df_rep.empty and 'Titel' in df_rep.columns:
-        # Label bauen
         df_rep['Label'] = df_rep.apply(lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})", axis=1)
-        
-        # Validierung der bereits gewählten Songs (falls DB sich geändert hat)
         all_options = df_rep['Label'].tolist()
         valid_selected = [s for s in st.session_state.gig_draft["selected_songs"] if s in all_options]
         
-        # Das Multiselect Feld (Durchsuchbar!)
-        # Wichtig: Wir schreiben das Ergebnis direkt wieder in session_state
-        selection = st.multiselect(
-            "Suche nach Titel oder Komponist (Tippen zum Filtern):",
-            options=all_options,
-            default=valid_selected
-        )
+        selection = st.multiselect("Suche (Titel/Komponist):", options=all_options, default=valid_selected)
         st.session_state.gig_draft["selected_songs"] = selection
         
         st.markdown("---")
         
         # --- SPEICHERN BUTTON ---
-        if st.button("✅ Auftritt final speichern", type="primary", use_container_width=True):
+        btn_text = "🔄 Änderungen speichern" if st.session_state.gig_draft["event_id"] else "✅ Auftritt final speichern"
+        
+        if st.button(btn_text, type="primary", use_container_width=True):
             # Validierung
             errors = []
-            if selected_loc == "Bitte wählen..." or (selected_loc == "➕ Neuer Ort..." and not final_loc_data["Name"]):
+            if selected_loc == "Bitte wählen..." or (selected_loc == "➕ Neuer Ort..." and not final_loc_data.get("Name")):
                 errors.append("Bitte Ort wählen oder eingeben.")
             if not selection:
                 errors.append("Bitte mindestens ein Stück wählen.")
@@ -263,73 +318,83 @@ if st.session_state.page == "speichern":
             if errors:
                 for e in errors: st.error(e)
             else:
-                # 1. Falls neuer Ort -> Erst speichern
+                # 1. Neuer Ort?
                 if selected_loc == "➕ Neuer Ort...":
                     save_location_direct(final_loc_data["Name"], final_loc_data["Strasse"], 
                                          final_loc_data["PLZ"], final_loc_data["Stadt"])
                 
-                # 2. Event speichern
+                # 2. Daten vorbereiten
                 datum_str = st.session_state.gig_draft["datum"].strftime("%d.%m.%Y")
                 time_str = st.session_state.gig_draft["uhrzeit"].strftime("%H:%M")
-                # Dateiname generieren
                 dateiname = f"{st.session_state.gig_draft['ensemble']}{datum_str}{final_loc_data['Stadt']}Setlist.xlsx"
                 
-                # Song IDs holen
                 song_ids = []
                 for label in selection:
                     row = df_rep[df_rep['Label'] == label].iloc[0]
                     song_ids.append(str(row['ID']))
                 
-                ws_ev = sh.worksheet("Events")
-                ws_ev.append_row([
-                    str(datetime.datetime.now()), 
+                # Datensatz für DB (ohne ID am Anfang, das macht die Save/Update funktion)
+                row_data_for_db = [
                     datum_str, time_str,
                     st.session_state.gig_draft["ensemble"],
                     final_loc_data["Name"], final_loc_data["Strasse"],
                     str(final_loc_data["PLZ"]), final_loc_data["Stadt"],
                     dateiname, ",".join(song_ids)
-                ])
+                ]
                 
-                st.balloons()
-                st.success(f"Gespeichert! Setlist: {dateiname}")
+                # 3. Speichern oder Updaten
+                if st.session_state.gig_draft["event_id"]:
+                    # UPDATE
+                    success = update_event_in_db(st.session_state.gig_draft["event_id"], row_data_for_db)
+                    msg = "Auftritt aktualisiert!"
+                else:
+                    # NEU
+                    # Neue Event ID berechnen
+                    ws_ev = sh.worksheet("Events")
+                    col_ids = ws_ev.col_values(1)[1:]
+                    e_ids = [int(x) for x in col_ids if str(x).isdigit()]
+                    new_ev_id = max(e_ids) + 1 if e_ids else 1
+                    
+                    ws_ev.append_row([new_ev_id] + row_data_for_db)
+                    success = True
+                    msg = "Auftritt neu gespeichert!"
                 
-                # Draft zurücksetzen
-                st.session_state.gig_draft["selected_songs"] = []
-                st.session_state.gig_draft["location_selection"] = "Bitte wählen..."
-                st.session_state.gig_draft["new_loc_name"] = ""
-                # Datum lassen wir stehen (praktisch für mehrere Einträge)
-                
-                time.sleep(2)
-                st.rerun()
+                if success:
+                    st.balloons()
+                    st.success(f"{msg} Setlist: {dateiname}")
+                    # Draft Reset
+                    st.session_state.gig_draft = {
+                        "event_id": None, "datum": datetime.date.today(), "uhrzeit": datetime.time(19, 0),
+                        "ensemble": "Tutti", "location_selection": "Bitte wählen...", 
+                        "new_loc_data": {}, "selected_songs": []
+                    }
+                    time.sleep(2)
+                    st.rerun()
 
     else:
         st.warning("Repertoire leer.")
 
 # ==========================================
-# ANDERE SEITEN (Repertoire, Orte, Archiv)
+# ANDERE SEITEN (Kurzfassungen)
 # ==========================================
 elif st.session_state.page == "repertoire":
     st.subheader("Repertoire verwalten")
-    # (Code für Repertoire-Seite bleibt gleich wie V3, hier gekürzt der Übersicht halber)
-    # Wenn du hier Änderungen brauchst, sag Bescheid, sonst nutze den existierenden Code
-    # WICHTIG: Füge hier den Repertoire-Code von V3 ein oder ich poste ihn nochmal komplett
-    # Damit der Code hier läuft, füge ich eine Basic Version ein:
-    
+    # Code für Repertoire (Copy Paste from previous versions if needed or stick to basic form)
     with st.form("simple_rep_add", clear_on_submit=True):
-        st.write("Neues Stück anlegen (Vollständige Bearbeitung im Popup oben möglich)")
+        st.write("Neues Stück anlegen")
         c1, c2 = st.columns([3,1])
         t = c1.text_input("Titel"); d = c2.text_input("Dauer", "03:00")
-        k = st.text_input("Komponist Nachname")
+        k = st.text_input("Komponist NN")
         if st.form_submit_button("Speichern"):
             save_song_direct(t, k, "", "", "", d, "")
             st.success("Gespeichert"); st.rerun()
-            
     st.divider()
     df_rep = load_repertoire()
     st.dataframe(df_rep, use_container_width=True)
 
 elif st.session_state.page == "orte":
     st.subheader("📍 Locations verwalten")
+    # Code für Orte
     with st.form("new_location"):
         l_name = st.text_input("Name"); l_str = st.text_input("Straße")
         c1, c2 = st.columns([1, 2])
@@ -344,5 +409,3 @@ elif st.session_state.page == "archiv":
     df_events = load_events()
     if not df_events.empty:
         st.dataframe(df_events, use_container_width=True)
-    else:
-        st.info("Leer.")
