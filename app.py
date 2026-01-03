@@ -12,7 +12,6 @@ DB_NAME = "GEMA_Datenbank"
 # --- SETUP & VERBINDUNG ---
 st.set_page_config(page_title="GEMA Manager", page_icon="xj", layout="centered")
 
-# INITIALISIERUNG DES GEDÄCHTNISSES
 if 'gig_draft' not in st.session_state:
     st.session_state.gig_draft = {
         "event_id": None,
@@ -24,7 +23,6 @@ if 'gig_draft' not in st.session_state:
         "selected_songs": []
     }
 
-# Speicher für Repertoire-Bearbeitung
 if 'rep_edit_state' not in st.session_state:
     st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
 
@@ -47,7 +45,7 @@ try:
     client, drive_service = get_gspread_client()
     sh = client.open(DB_NAME)
 except Exception as e:
-    st.error(f"Verbindungsfehler (Bitte Seite neu laden): {e}")
+    st.error(f"Verbindungsfehler: {e}")
     st.stop()
 
 # --- DB FUNKTIONEN (CACHED) ---
@@ -86,9 +84,23 @@ def get_data_repertoire():
     for col in required:
         if col not in df.columns: df[col] = ""
     
-    # ID BEREINIGUNG: Alles zu String ohne Kommastellen
+    # 1. ID BEREINIGUNG (Wichtig!)
     if not df.empty:
-        df['ID'] = df['ID'].apply(lambda x: str(int(float(x))) if str(x).replace('.','',1).isdigit() else str(x))
+        # Versucht alles in eine saubere String-Zahl ohne .0 zu wandeln
+        def clean_id_cell(x):
+            try: return str(int(float(str(x).replace(',','.'))))
+            except: return str(x)
+        df['ID'] = df['ID'].apply(clean_id_cell)
+
+        # 2. LABEL ZENTRAL ERSTELLEN
+        # Damit wir überall exakt denselben String haben
+        def make_label(row):
+            base = f"{row['Titel']} ({row['Komponist_Nachname']})"
+            if row['Bearbeiter_Nachname']:
+                base += f" / Arr: {row['Bearbeiter_Nachname']}"
+            return base
+        
+        df['Label'] = df.apply(make_label, axis=1)
     
     return df
 
@@ -115,8 +127,8 @@ def clear_all_caches():
     get_data_events.clear()
 
 # --- HELPER: ID CLEANER ---
-def clean_id_list(raw_input):
-    """Macht aus allem eine saubere String-Liste"""
+def clean_id_list_from_string(raw_input):
+    """Macht aus '1, 2.0, 3' eine saubere Liste ['1', '2', '3']"""
     if not raw_input: return []
     str_val = str(raw_input)
     parts = str_val.split(',')
@@ -125,7 +137,6 @@ def clean_id_list(raw_input):
         s = p.strip()
         if not s: continue
         try:
-            # 1.0 -> 1 -> "1"
             val = int(float(s))
             clean_ids.append(str(val))
         except:
@@ -154,7 +165,6 @@ def save_song_direct(mode, song_id, titel, kn, kv, bn, bv, dauer, verlag):
         try:
             cell = ws.find(str(song_id), in_column=1)
             r = cell.row
-            # Update Titel bis Verlag (B bis H)
             ws.update(f"B{r}:H{r}", [[titel, kn, kv, bn, bv, dauer, verlag]])
             msg = f"'{titel}' aktualisiert!"
         except: return False, "Fehler beim Update"
@@ -209,7 +219,7 @@ navigation_bar()
 if st.session_state.page == "speichern":
     
     df_loc = get_data_locations()
-    df_rep = get_data_repertoire()
+    df_rep = get_data_repertoire() # Hier wird jetzt das Label zentral erstellt!
     df_events = get_data_events()
     
     # --- EDITIER-FUNKTION ---
@@ -232,29 +242,18 @@ if st.session_state.page == "speichern":
                         st.session_state.gig_draft["ensemble"] = row['Ensemble']
                         st.session_state.gig_draft["location_selection"] = row['Location_Name']
                         
-                        # --- CLEANING & RESTORE ---
-                        saved_ids = clean_id_list(row['Songs_IDs'])
-                        restored_labels = []
-                        found_count = 0
+                        # ID LOGIK:
+                        saved_ids = clean_id_list_from_string(row['Songs_IDs'])
                         
-                        if not df_rep.empty:
-                            df_rep['Label'] = df_rep.apply(lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})", axis=1)
-                            # ID Mapping strikt als String
-                            id_to_label = dict(zip(df_rep['ID'].astype(str), df_rep['Label']))
-                            
-                            for sid in saved_ids:
-                                if sid in id_to_label:
-                                    restored_labels.append(id_to_label[sid])
-                                    found_count += 1
+                        restored_labels = []
+                        if not df_rep.empty and 'Label' in df_rep.columns:
+                            # Wir filtern direkt im DataFrame nach den IDs
+                            # Das ist sicherer als ein Dictionary Lookup
+                            selected_rows = df_rep[df_rep['ID'].isin(saved_ids)]
+                            restored_labels = selected_rows['Label'].tolist()
                         
                         st.session_state.gig_draft["selected_songs"] = restored_labels
-                        
-                        if found_count < len(saved_ids):
-                            st.warning(f"Achtung: {found_count} von {len(saved_ids)} Songs gefunden. (Datenbank-Abweichung)")
-                        else:
-                            st.toast("Erfolgreich geladen!", icon="✅")
-                            
-                        time.sleep(1); st.rerun()
+                        st.toast("Geladen!", icon="✏️"); time.sleep(0.5); st.rerun()
             else:
                 st.info("Keine gespeicherten Auftritte.")
 
@@ -322,9 +321,11 @@ if st.session_state.page == "speichern":
                     st.toast(f"'{q_tit}' hinzugefügt!", icon="✅"); time.sleep(1); st.rerun()
                 else: st.error("Pflichtfelder fehlen.")
 
-    if not df_rep.empty and 'Titel' in df_rep.columns:
-        df_rep['Label'] = df_rep.apply(lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})", axis=1)
+    if not df_rep.empty and 'Label' in df_rep.columns:
+        # Hier nutzen wir exakt dieselbe Spalte 'Label', die oben generiert wurde
         all_options = df_rep['Label'].tolist()
+        
+        # Validierung: Nur Songs, die auch wirklich in 'all_options' existieren
         valid_selected = [s for s in st.session_state.gig_draft["selected_songs"] if s in all_options]
         
         selection = st.multiselect("Suche:", options=all_options, default=valid_selected)
@@ -349,6 +350,7 @@ if st.session_state.page == "speichern":
                 time_str = st.session_state.gig_draft["uhrzeit"].strftime("%H:%M")
                 dateiname = f"{st.session_state.gig_draft['ensemble']}{datum_str}{final_loc_data['Stadt']}Setlist.xlsx"
                 
+                # IDs holen (wieder über das Label matchen)
                 song_ids = []
                 for label in selection:
                     row = df_rep[df_rep['Label'] == label].iloc[0]
@@ -378,7 +380,7 @@ if st.session_state.page == "speichern":
     else: st.warning("Repertoire leer.")
 
 # ==========================================
-# SEITE 2: REPERTOIRE (NEU: SUCHE & EDIT)
+# SEITE 2: REPERTOIRE (SUCHE & EDIT)
 # ==========================================
 elif st.session_state.page == "repertoire":
     st.subheader("Repertoire verwalten")
@@ -388,14 +390,11 @@ elif st.session_state.page == "repertoire":
 
     # --- DATEN VORBEREITEN ---
     if rep_mode == "Bearbeiten":
-        if not df_rep.empty:
-            df_rep['Label'] = df_rep.apply(lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})", axis=1)
+        if not df_rep.empty and 'Label' in df_rep.columns:
             search_rep = st.selectbox("Stück suchen & laden:", df_rep['Label'].tolist(), index=None, placeholder="Tippen zum Suchen...")
             
-            # Lade Daten in den State, wenn Auswahl getroffen
             if search_rep:
                 row = df_rep[df_rep['Label'] == search_rep].iloc[0]
-                # Nur laden, wenn wir nicht schon denselben geladen haben (um edits nicht zu überschreiben)
                 if st.session_state.rep_edit_state["id"] != row['ID']:
                     st.session_state.rep_edit_state = {
                         "id": row['ID'], "titel": row['Titel'], "dauer": str(row['Dauer']),
@@ -407,11 +406,10 @@ elif st.session_state.page == "repertoire":
             st.warning("Liste leer.")
 
     elif rep_mode == "Neu anlegen":
-        # Reset State für Neu
         if st.session_state.rep_edit_state["id"] is not None:
              st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "03:00", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
 
-    # --- DAS FORMULAR ---
+    # --- FORMULAR ---
     with st.form("rep_form"):
         s = st.session_state.rep_edit_state
         c1, c2 = st.columns([3,1])
@@ -430,7 +428,6 @@ elif st.session_state.page == "repertoire":
             success, msg = save_song_direct(mode_arg, s["id"], t, kn, kv, bn, bv, d, ver)
             if success:
                 st.success(msg)
-                # Reset
                 st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
                 time.sleep(1); st.rerun()
             else:
@@ -440,7 +437,7 @@ elif st.session_state.page == "repertoire":
     st.dataframe(df_rep, use_container_width=True)
 
 # ==========================================
-# REST (Orte / Archiv)
+# REST
 # ==========================================
 elif st.session_state.page == "orte":
     st.subheader("Locations")
