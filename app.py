@@ -12,19 +12,8 @@ DB_NAME = "GEMA_Datenbank"
 # --- SETUP & VERBINDUNG ---
 st.set_page_config(page_title="GEMA Manager", page_icon="xj", layout="centered")
 
-# Session State initialisieren (Das Gedächtnis der App)
 if 'page' not in st.session_state:
-    st.session_state.page = "planer" # Startseite
-
-# Cache für den Planer initialisieren (falls noch nicht da)
-if 'planer_cache' not in st.session_state:
-    st.session_state.planer_cache = {
-        "datum": datetime.date.today(),
-        "ensemble": "Tutti",
-        "ort": "Eschwege",
-        "selected_songs": [], # Hier merken wir uns die Lieder
-        "search_term": ""
-    }
+    st.session_state.page = "speichern" # Startseite geändert
 
 @st.cache_resource
 def get_gspread_client():
@@ -54,22 +43,37 @@ def check_and_fix_db():
     except:
         ws_rep = sh.add_worksheet(title="Repertoire", rows=100, cols=15)
     
-    required_headers = ['ID', 'Titel', 'Komponist_Nachname', 'Komponist_Vorname', 
-                        'Bearbeiter_Nachname', 'Bearbeiter_Vorname', 'Dauer', 'Verlag', 'Werkeart', 'ISWC']
-    
-    current_headers = ws_rep.row_values(1)
-    if not current_headers or current_headers[0] != 'ID':
-        ws_rep.update('A1:J1', [required_headers])
+    rep_headers = ['ID', 'Titel', 'Komponist_Nachname', 'Komponist_Vorname', 
+                   'Bearbeiter_Nachname', 'Bearbeiter_Vorname', 'Dauer', 'Verlag', 'Werkeart', 'ISWC']
+    curr_rep = ws_rep.row_values(1)
+    if not curr_rep or curr_rep[0] != 'ID':
+        ws_rep.update('A1:J1', [rep_headers])
 
-    # 2. Events
+    # 2. Events (JETZT MIT ADRESSE & UHRZEIT)
     try:
         ws_ev = sh.worksheet("Events")
     except:
-        ws_ev = sh.add_worksheet(title="Events", rows=100, cols=10)
+        ws_ev = sh.add_worksheet(title="Events", rows=100, cols=15)
         
-    event_headers = ['Event_ID', 'Datum', 'Ensemble', 'Ort', 'Setlist_Name', 'Songs_IDs']
-    if not ws_ev.row_values(1):
-        ws_ev.update('A1:F1', [event_headers])
+    # Neue Struktur für Events
+    event_headers = ['Event_ID', 'Datum', 'Uhrzeit', 'Ensemble', 'Location_Name', 
+                     'Strasse', 'PLZ', 'Stadt', 'Setlist_Name', 'Songs_IDs']
+    curr_ev = ws_ev.row_values(1)
+    # Checken ob "Uhrzeit" schon da ist, sonst updaten
+    if not curr_ev or 'Uhrzeit' not in curr_ev:
+        ws_ev.clear() # Sicherheitshalber clearen bei Strukturänderung
+        ws_ev.update('A1:J1', [event_headers])
+
+    # 3. Locations (NEU!)
+    try:
+        ws_loc = sh.worksheet("Locations")
+    except:
+        ws_loc = sh.add_worksheet(title="Locations", rows=50, cols=5)
+    
+    loc_headers = ['ID', 'Name', 'Strasse', 'PLZ', 'Stadt']
+    curr_loc = ws_loc.row_values(1)
+    if not curr_loc or curr_loc[0] != 'ID':
+        ws_loc.update('A1:E1', [loc_headers])
 
 def load_repertoire():
     ws = sh.worksheet("Repertoire")
@@ -79,6 +83,14 @@ def load_repertoire():
     for col in required:
         if col not in df.columns:
             df[col] = ""
+    return df
+
+def load_locations():
+    ws = sh.worksheet("Locations")
+    data = ws.get_all_records()
+    df = pd.DataFrame(data)
+    if df.empty:
+        return pd.DataFrame(columns=['ID', 'Name', 'Strasse', 'PLZ', 'Stadt'])
     return df
 
 def load_events():
@@ -97,7 +109,7 @@ def save_song(mode, song_id, titel, kn, kv, bn, bv, dauer, verlag):
         new_id = max(ids) + 1 if ids else 1
         row = [new_id, titel, kn, kv, bn, bv, dauer, verlag, "U-Musik", ""]
         ws.append_row(row)
-        return True, f"'{titel}' neu angelegt!"
+        return True, f"'{titel}' angelegt!"
     elif mode == "Edit":
         try:
             cell = ws.find(str(song_id), in_column=1)
@@ -107,23 +119,34 @@ def save_song(mode, song_id, titel, kn, kv, bn, bv, dauer, verlag):
         except Exception as e:
             return False, f"Fehler: {e}"
 
+def save_location(name, strasse, plz, stadt):
+    ws = sh.worksheet("Locations")
+    col_ids = ws.col_values(1)[1:]
+    ids = [int(x) for x in col_ids if str(x).isdigit()]
+    new_id = max(ids) + 1 if ids else 1
+    
+    ws.append_row([new_id, name, strasse, plz, stadt])
+
 # --- NAVIGATION ---
 
 def navigation_bar():
     st.markdown("---")
-    c1, c2, c3 = st.columns(3)
+    # 4 Buttons für die Bereiche
+    c1, c2, c3, c4 = st.columns(4)
     
-    # Wir speichern NICHT hier, sondern direkt bei Eingabe im Widget (on_change ist nicht nötig, wir lesen session_state)
-    
-    if c1.button("🎵 Repertoire", use_container_width=True):
+    if c1.button("💾 Speichern", use_container_width=True):
+        st.session_state.page = "speichern"
+        st.rerun()
+        
+    if c2.button("🎵 Repertoire", use_container_width=True):
         st.session_state.page = "repertoire"
         st.rerun()
-        
-    if c2.button("📅 Planer", use_container_width=True):
-        st.session_state.page = "planer"
+
+    if c3.button("📍 Orte", use_container_width=True):
+        st.session_state.page = "orte"
         st.rerun()
         
-    if c3.button("📂 Archiv", use_container_width=True):
+    if c4.button("📂 Archiv", use_container_width=True):
         st.session_state.page = "archiv"
         st.rerun()
     st.markdown("---")
@@ -136,12 +159,121 @@ st.title("Orchester Manager 🎻")
 
 navigation_bar()
 
-# SEITE: REPERTOIRE
-if st.session_state.page == "repertoire":
+# --- SEITE: AUFTRITT SPEICHERN ---
+if st.session_state.page == "speichern":
+    st.subheader("Vergangenen Auftritt erfassen")
+    
+    # DATEN LADEN
+    df_loc = load_locations()
+    df_rep = load_repertoire()
+
+    # FORMULAR FÜR RAHMENDATEN (Verhindert Neuladen beim Tippen!)
+    # Wir benutzen jetzt eine Form für die Metadaten
+    with st.form("metadata_form"):
+        c_date, c_time = st.columns(2)
+        inp_date = c_date.date_input("Datum", datetime.date.today())
+        inp_time = c_time.time_input("Uhrzeit", datetime.time(19, 0)) # Standard 19 Uhr
+        
+        c_ens, c_loc = st.columns(2)
+        inp_ens = c_ens.selectbox("Ensemble", ["Tutti", "BQ", "Quartett", "Duo"])
+        
+        # Location Dropdown
+        loc_options = ["Bitte wählen..."] + df_loc['Name'].tolist() if not df_loc.empty else ["Bitte wählen..."]
+        inp_loc_name = c_loc.selectbox("Spielort", loc_options)
+        
+        st.caption("Erst Rahmendaten bestätigen, dann Stücke wählen:")
+        meta_submitted = st.form_submit_button("1. Daten bestätigen & Stücke wählen")
+    
+    # Logik: Zeige Song-Auswahl erst, wenn Location gewählt ist (oder User Button drückt)
+    if inp_loc_name != "Bitte wählen...":
+        
+        # Location Details holen
+        loc_data = df_loc[df_loc['Name'] == inp_loc_name].iloc[0]
+        st.info(f"📍 Gewählt: {loc_data['Name']}, {loc_data['Strasse']}, {loc_data['PLZ']} {loc_data['Stadt']}")
+        
+        st.markdown("### 2. Programmwahl")
+        
+        if not df_rep.empty and 'Titel' in df_rep.columns:
+            df_rep['Label'] = df_rep.apply(
+                lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})" + (f" / Arr: {x['Bearbeiter_Nachname']}" if x['Bearbeiter_Nachname'] else ""), 
+                axis=1
+            )
+            
+            # Suche (Außerhalb Formular, damit dynamisch)
+            search_filter = st.text_input("🔎 Repertoire filtern:", placeholder="Tippe Titel...")
+            
+            options = df_rep['Label'].tolist()
+            if search_filter:
+                options = [opt for opt in options if search_filter.lower() in opt.lower()]
+                
+            selected_labels = st.multiselect("Gespielte Stücke (in Reihenfolge):", options)
+            
+            # ABSCHLUSS BUTTON
+            if st.button("✅ Auftritt final speichern", type="primary", use_container_width=True):
+                if not selected_labels:
+                    st.error("Bitte mindestens ein Stück auswählen.")
+                else:
+                    datum_str = inp_date.strftime("%d.%m.%Y")
+                    time_str = inp_time.strftime("%H:%M")
+                    dateiname = f"{inp_ens}{datum_str}{loc_data['Stadt']}Setlist.xlsx" # Ort aus DB nutzen!
+                    
+                    song_ids = []
+                    for label in selected_labels:
+                        row = df_rep[df_rep['Label'] == label].iloc[0]
+                        song_ids.append(str(row['ID']))
+                    
+                    ws_ev = sh.worksheet("Events")
+                    ws_ev.append_row([
+                        str(datetime.datetime.now()), 
+                        datum_str,
+                        time_str,
+                        inp_ens,
+                        loc_data['Name'], # Location Name
+                        loc_data['Strasse'],
+                        str(loc_data['PLZ']),
+                        loc_data['Stadt'],
+                        dateiname, 
+                        ",".join(song_ids)
+                    ])
+                    
+                    st.balloons()
+                    st.success(f"Gespeichert! Setlist: {dateiname}")
+                    time.sleep(2)
+                    st.rerun()
+        else:
+            st.warning("Repertoire leer.")
+    else:
+        st.info("Bitte wähle oben einen Spielort aus (oder lege unter 'Orte' einen neuen an).")
+
+# --- SEITE: ORTE VERWALTEN ---
+elif st.session_state.page == "orte":
+    st.subheader("📍 Locations verwalten")
+    
+    with st.form("new_location"):
+        st.write("Neuen Spielort anlegen")
+        l_name = st.text_input("Name (z.B. Stadthalle Eschwege)")
+        l_str = st.text_input("Straße & Hausnummer")
+        c1, c2 = st.columns([1, 2])
+        l_plz = c1.text_input("PLZ")
+        l_stadt = c2.text_input("Stadt")
+        
+        if st.form_submit_button("Ort speichern"):
+            if l_name and l_stadt:
+                save_location(l_name, l_str, l_plz, l_stadt)
+                st.success(f"Ort '{l_name}' gespeichert!")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error("Name und Stadt sind Pflicht.")
+                
+    st.divider()
+    st.write("Gespeicherte Orte:")
+    st.dataframe(load_locations(), use_container_width=True, hide_index=True)
+
+# --- SEITE: REPERTOIRE (Gleich geblieben) ---
+elif st.session_state.page == "repertoire":
     st.subheader("Repertoire verwalten")
-    
     mode = st.radio("Modus:", ["Neu anlegen", "Bearbeiten"], horizontal=True, label_visibility="collapsed")
-    
     f_id = None
     default_vals = {"titel": "", "kn": "", "kv": "", "bn": "", "bv": "", "dauer": "03:00", "verlag": ""}
     
@@ -149,195 +281,62 @@ if st.session_state.page == "repertoire":
         df_rep = load_repertoire()
         if not df_rep.empty:
             df_rep['Label'] = df_rep.apply(lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})", axis=1)
-            
-            search_term = st.text_input("🔍 Titel suchen:", placeholder="Tippe zum Filtern...")
-            
+            search_term = st.text_input("🔍 Suchen:", placeholder="Titel...")
             if search_term:
                 filtered_df = df_rep[df_rep['Label'].str.contains(search_term, case=False)]
             else:
                 filtered_df = df_rep
 
             if not filtered_df.empty:
-                selected_label = st.selectbox("Stück auswählen:", filtered_df['Label'].tolist())
+                selected_label = st.selectbox("Auswahl:", filtered_df['Label'].tolist())
                 song_data = df_rep[df_rep['Label'] == selected_label].iloc[0]
-                
                 f_id = int(song_data['ID'])
-                default_vals["titel"] = song_data['Titel']
-                default_vals["kn"] = song_data['Komponist_Nachname']
-                default_vals["kv"] = song_data['Komponist_Vorname']
-                default_vals["bn"] = song_data['Bearbeiter_Nachname']
-                default_vals["bv"] = song_data['Bearbeiter_Vorname']
-                default_vals["dauer"] = str(song_data['Dauer'])
-                default_vals["verlag"] = song_data['Verlag']
+                default_vals = {"titel": song_data['Titel'], "kn": song_data['Komponist_Nachname'], 
+                                "kv": song_data['Komponist_Vorname'], "bn": song_data['Bearbeiter_Nachname'],
+                                "bv": song_data['Bearbeiter_Vorname'], "dauer": str(song_data['Dauer']),
+                                "verlag": song_data['Verlag']}
             else:
-                st.warning("Kein Titel gefunden.")
+                st.warning("Nichts gefunden.")
                 st.stop()
-        else:
-            st.warning("Datenbank leer.")
+        else: 
             st.stop()
 
     with st.form("song_form", clear_on_submit=(mode=="Neu anlegen")):
-        st.caption(f"Modus: {mode}")
         c1, c2 = st.columns([3, 1])
         titel = c1.text_input("Titel", value=default_vals["titel"])
         dauer = c2.text_input("Dauer", value=default_vals["dauer"])
-        
         c3, c4 = st.columns(2)
-        kn = c3.text_input("Komponist Nachname", value=default_vals["kn"])
-        kv = c4.text_input("Komponist Vorname", value=default_vals["kv"])
-        
+        kn = c3.text_input("Komponist NN", value=default_vals["kn"])
+        kv = c4.text_input("Komponist VN", value=default_vals["kv"])
         c5, c6 = st.columns(2)
-        bn = c5.text_input("Bearbeiter Nachname", value=default_vals["bn"])
-        bv = c6.text_input("Bearbeiter Vorname", value=default_vals["bv"])
-        
+        bn = c5.text_input("Bearb. NN", value=default_vals["bn"])
+        bv = c6.text_input("Bearb. VN", value=default_vals["bv"])
         verlag = st.text_input("Verlag", value=default_vals["verlag"])
         
-        submitted = st.form_submit_button("💾 Speichern", use_container_width=True)
-        
-        if submitted:
+        if st.form_submit_button("💾 Speichern", use_container_width=True):
             if not titel or not kn:
                 st.error("Pflichtfelder fehlen!")
             else:
-                action_mode = "Edit" if mode == "Bearbeiten" else "Neu"
-                success, msg = save_song(action_mode, f_id, titel, kn, kv, bn, bv, dauer, verlag)
+                action = "Edit" if mode == "Bearbeiten" else "Neu"
+                success, msg = save_song(action, f_id, titel, kn, kv, bn, bv, dauer, verlag)
                 if success:
-                    st.toast(msg, icon="✅")
-                    time.sleep(1)
-                    st.rerun()
+                    st.toast(msg, icon="✅"); time.sleep(1); st.rerun()
 
-# SEITE: PLANER
-elif st.session_state.page == "planer":
-    st.subheader("Auftritt planen")
-    
-    # 1. DATEN LADEN / CACHE UPDATEN
-    # Wir benutzen den Cache als 'value', schreiben aber Änderungen sofort zurück
-    
-    col_a, col_b = st.columns(2)
-    
-    # Datum
-    new_date = col_a.date_input("Datum", value=st.session_state.planer_cache["datum"])
-    st.session_state.planer_cache["datum"] = new_date
-    
-    # Ensemble
-    ens_options = ["Tutti", "BQ", "Quartett", "Duo"]
-    # Sicherstellen, dass der gecachte Wert noch gültig ist (falls man Optionen ändert)
-    default_ens = st.session_state.planer_cache["ensemble"]
-    if default_ens not in ens_options: default_ens = "Tutti"
-    
-    new_ens = col_b.selectbox("Ensemble", ens_options, index=ens_options.index(default_ens))
-    st.session_state.planer_cache["ensemble"] = new_ens
-    
-    # Ort
-    new_ort = st.text_input("Ort", value=st.session_state.planer_cache["ort"])
-    st.session_state.planer_cache["ort"] = new_ort
-    
-    # 2. SONG AUSWAHL
-    df_rep = load_repertoire()
-    
-    if not df_rep.empty and 'Titel' in df_rep.columns:
-        df_rep['Label'] = df_rep.apply(
-            lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})" + (f" / Arr: {x['Bearbeiter_Nachname']}" if x['Bearbeiter_Nachname'] else ""), 
-            axis=1
-        )
-        
-        st.write("Programm zusammenstellen:")
-        
-        # Suche im Cache speichern
-        search_filter = st.text_input("🔎 Repertoire durchsuchen:", 
-                                      value=st.session_state.planer_cache["search_term"],
-                                      placeholder="Suchbegriff eingeben...")
-        st.session_state.planer_cache["search_term"] = search_filter
-        
-        all_options = df_rep['Label'].tolist()
-        
-        # Validierung: Prüfen, ob die im Cache gespeicherten Songs noch in der DB existieren
-        # (Falls du im Repertoire was umbenannt hast)
-        valid_cached_songs = [s for s in st.session_state.planer_cache["selected_songs"] if s in all_options]
-        
-        # Filterlogik für die Anzeige
-        if search_filter:
-            filtered_options = [opt for opt in all_options if search_filter.lower() in opt.lower()]
-        else:
-            filtered_options = all_options
-            
-        # Multiselect
-        # Wichtig: "default" sind die bereits gewählten (validen) Songs
-        # Wir müssen sicherstellen, dass die 'default' Werte auch in den 'options' enthalten sind
-        # Trick: Wir kombinieren gefilterte Optionen mit den bereits gewählten, damit nichts abstürzt
-        display_options = list(set(filtered_options + valid_cached_songs))
-        
-        # Sortieren für bessere Optik
-        display_options.sort()
-        
-        new_selection = st.multiselect(
-            "Auswahl (Reihenfolge!):", 
-            options=display_options,
-            default=valid_cached_songs
-        )
-        
-        # SOFORT im Cache speichern
-        st.session_state.planer_cache["selected_songs"] = new_selection
-        
-        st.markdown("---")
-        
-        if st.button("🚀 Setliste speichern", use_container_width=True):
-            datum_str = new_date.strftime("%d.%m.%Y")
-            dateiname = f"{new_ens}{datum_str}{new_ort}Setlist.xlsx"
-            
-            song_ids = []
-            for label in new_selection:
-                row = df_rep[df_rep['Label'] == label].iloc[0]
-                song_ids.append(str(row['ID']))
-            
-            ws_ev = sh.worksheet("Events")
-            ws_ev.append_row([
-                str(datetime.datetime.now()), 
-                datum_str, 
-                new_ens, 
-                new_ort, 
-                dateiname, 
-                ",".join(song_ids)
-            ])
-            
-            # Cache leeren nach erfolgreichem Speichern?
-            # Macht Sinn, damit man den nächsten Gig planen kann
-            st.session_state.planer_cache["selected_songs"] = []
-            # Ort lassen wir stehen, ist oft gleich
-            
-            st.toast(f"Gespeichert!", icon="🎉")
-            st.success(f"Auftritt **{new_ort}** angelegt.")
-            st.info("ℹ️ Excel-Generierung folgt im nächsten Schritt.")
-            time.sleep(2)
-            st.rerun() # Reload um Formular zu leeren
-    else:
-        st.info("Repertoire leer.")
-
-# SEITE: ARCHIV
+# --- SEITE: ARCHIV ---
 elif st.session_state.page == "archiv":
     st.subheader("📂 Setlist Archiv")
-    
     df_events = load_events()
-    
     if not df_events.empty and 'Datum_Obj' in df_events.columns:
         df_events = df_events.sort_values(by='Datum_Obj', ascending=False)
-        years = df_events['Datum_Obj'].dt.year.unique()
-        
-        for year in years:
+        for year in df_events['Datum_Obj'].dt.year.unique():
             st.markdown(f"### {year}")
             df_year = df_events[df_events['Datum_Obj'].dt.year == year]
-            months = df_year['Datum_Obj'].dt.month.unique()
-            for month in months:
-                month_name = datetime.date(2000, int(month), 1).strftime('%B')
-                with st.expander(f"{month_name} ({len(df_year[df_year['Datum_Obj'].dt.month == month])} Auftritte)"):
-                    events_month = df_year[df_year['Datum_Obj'].dt.month == month]
-                    for idx, row in events_month.iterrows():
-                        c_info, c_link = st.columns([3, 1])
-                        with c_info:
-                            st.write(f"**{row['Datum']} - {row['Ort']}**")
-                            st.caption(f"{row['Ensemble']} | {row['Setlist_Name']}")
-                        with c_link:
-                            search_url = f"https://drive.google.com/drive/search?q={row['Setlist_Name']}"
-                            st.link_button("Öffnen", search_url)
+            for month in df_year['Datum_Obj'].dt.month.unique():
+                m_name = datetime.date(2000, int(month), 1).strftime('%B')
+                with st.expander(f"{m_name} ({len(df_year[df_year['Datum_Obj'].dt.month == month])})"):
+                    for _, row in df_year[df_year['Datum_Obj'].dt.month == month].iterrows():
+                        st.write(f"**{row['Datum']}** | {row['Location_Name']}")
+                        st.caption(f"{row['Ensemble']} | {row['Uhrzeit']} Uhr | {row['Setlist_Name']}")
                         st.divider()
     else:
-        st.info("Noch keine Auftritte gespeichert.")
+        st.info("Keine Einträge.")
