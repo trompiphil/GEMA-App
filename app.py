@@ -27,7 +27,6 @@ if 'gig_draft' not in st.session_state:
 if 'page' not in st.session_state:
     st.session_state.page = "speichern"
 
-# Nur einmal ausführen pro Session!
 if 'db_checked' not in st.session_state:
     st.session_state.db_checked = False
 
@@ -50,9 +49,7 @@ except Exception as e:
 # --- DB FUNKTIONEN (CACHED) ---
 
 def check_and_fix_db():
-    """Prüft Struktur nur 1x pro Sitzung, um Quota zu sparen"""
-    if st.session_state.db_checked:
-        return
+    if st.session_state.db_checked: return
 
     try: ws_rep = sh.worksheet("Repertoire")
     except: ws_rep = sh.add_worksheet(title="Repertoire", rows=100, cols=15)
@@ -76,10 +73,7 @@ def check_and_fix_db():
     
     st.session_state.db_checked = True
 
-# --- CACHING DECORATORS ---
-# Das hier ist die Magie: Daten werden im RAM gehalten und nicht jedes Mal neu geladen!
-
-@st.cache_data(ttl=600) # Hält Daten für 10 Minuten im Speicher
+@st.cache_data(ttl=600)
 def get_data_repertoire():
     ws = sh.worksheet("Repertoire")
     data = ws.get_all_records()
@@ -107,7 +101,6 @@ def get_data_events():
     return df
 
 def clear_all_caches():
-    """Löscht den Cache, damit nach dem Speichern die neuen Daten geladen werden"""
     get_data_repertoire.clear()
     get_data_locations.clear()
     get_data_events.clear()
@@ -122,7 +115,7 @@ def save_song_direct(titel, kn, kv, bn, bv, dauer, verlag):
         new_id = max(ids) + 1 if ids else 1
         row = [new_id, titel, kn, kv, bn, bv, dauer, verlag, "U-Musik", ""]
         ws.append_row(row)
-        clear_all_caches() # Cache leeren!
+        clear_all_caches()
         return True
     except: return False
 
@@ -132,7 +125,7 @@ def save_location_direct(name, strasse, plz, stadt):
     ids = [int(x) for x in col_ids if str(x).isdigit()]
     new_id = max(ids) + 1 if ids else 1
     ws.append_row([new_id, name, strasse, plz, stadt])
-    clear_all_caches() # Cache leeren!
+    clear_all_caches()
     return True
 
 def update_event_in_db(event_id, row_data):
@@ -141,7 +134,7 @@ def update_event_in_db(event_id, row_data):
         cell = ws.find(str(event_id), in_column=1)
         row_num = cell.row
         ws.update(f"A{row_num}:J{row_num}", [[event_id] + row_data])
-        clear_all_caches() # Cache leeren!
+        clear_all_caches()
         return True
     except Exception as e:
         st.error(f"Fehler: {e}")
@@ -173,7 +166,6 @@ navigation_bar()
 # ==========================================
 if st.session_state.page == "speichern":
     
-    # DATEN LADEN (JETZT GECACHED UND SCHNELL!)
     df_loc = get_data_locations()
     df_rep = get_data_repertoire()
     df_events = get_data_events()
@@ -197,13 +189,23 @@ if st.session_state.page == "speichern":
                     st.session_state.gig_draft["ensemble"] = row['Ensemble']
                     st.session_state.gig_draft["location_selection"] = row['Location_Name']
                     
-                    saved_ids = str(row['Songs_IDs']).split(",")
+                    # --- HIER WAR DER FEHLER: JETZT KORRIGIERT ---
+                    # Wir splitten am Komma UND entfernen Leerzeichen mit .strip()
+                    saved_ids_str = str(row['Songs_IDs'])
+                    if saved_ids_str and saved_ids_str.strip():
+                        saved_ids = [s.strip() for s in saved_ids_str.split(",") if s.strip()]
+                    else:
+                        saved_ids = []
+
                     restored_labels = []
                     if not df_rep.empty:
                         df_rep['Label'] = df_rep.apply(lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})", axis=1)
+                        # Sicherstellen, dass die Keys Strings sind
                         id_to_label = dict(zip(df_rep['ID'].astype(str), df_rep['Label']))
+                        
                         for sid in saved_ids:
-                            if sid in id_to_label: restored_labels.append(id_to_label[sid])
+                            if sid in id_to_label:
+                                restored_labels.append(id_to_label[sid])
                                 
                     st.session_state.gig_draft["selected_songs"] = restored_labels
                     st.toast("Geladen!", icon="✏️"); time.sleep(0.5); st.rerun()
@@ -319,7 +321,7 @@ if st.session_state.page == "speichern":
                     e_ids = [int(x) for x in col_ids if str(x).isdigit()]
                     new_ev_id = max(e_ids) + 1 if e_ids else 1
                     ws_ev.append_row([new_ev_id] + row_data)
-                    clear_all_caches() # Wichtig!
+                    clear_all_caches() 
                     success = True
                 
                 if success:
@@ -335,7 +337,7 @@ if st.session_state.page == "speichern":
     else: st.warning("Repertoire leer.")
 
 # ==========================================
-# ANDERE SEITEN (Kurz)
+# ANDERE SEITEN
 # ==========================================
 elif st.session_state.page == "repertoire":
     st.subheader("Repertoire")
