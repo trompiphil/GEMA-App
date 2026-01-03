@@ -24,6 +24,10 @@ if 'gig_draft' not in st.session_state:
         "selected_songs": []
     }
 
+# Speicher für Repertoire-Bearbeitung
+if 'rep_edit_state' not in st.session_state:
+    st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
+
 if 'page' not in st.session_state:
     st.session_state.page = "speichern"
 
@@ -43,7 +47,7 @@ try:
     client, drive_service = get_gspread_client()
     sh = client.open(DB_NAME)
 except Exception as e:
-    st.error(f"Verbindungsfehler (Bitte Seite neu laden in 1 min): {e}")
+    st.error(f"Verbindungsfehler (Bitte Seite neu laden): {e}")
     st.stop()
 
 # --- DB FUNKTIONEN (CACHED) ---
@@ -81,6 +85,11 @@ def get_data_repertoire():
     required = ['ID', 'Titel', 'Komponist_Nachname', 'Bearbeiter_Nachname']
     for col in required:
         if col not in df.columns: df[col] = ""
+    
+    # ID BEREINIGUNG: Alles zu String ohne Kommastellen
+    if not df.empty:
+        df['ID'] = df['ID'].apply(lambda x: str(int(float(x))) if str(x).replace('.','',1).isdigit() else str(x))
+    
     return df
 
 @st.cache_data(ttl=600)
@@ -105,9 +114,9 @@ def clear_all_caches():
     get_data_locations.clear()
     get_data_events.clear()
 
-# --- HELPER: ID CLEANER (DIE WASCHMASCHINE) ---
+# --- HELPER: ID CLEANER ---
 def clean_id_list(raw_input):
-    """Macht aus '1, 2.0, 3' eine saubere Liste ['1', '2', '3']"""
+    """Macht aus allem eine saubere String-Liste"""
     if not raw_input: return []
     str_val = str(raw_input)
     parts = str_val.split(',')
@@ -116,6 +125,7 @@ def clean_id_list(raw_input):
         s = p.strip()
         if not s: continue
         try:
+            # 1.0 -> 1 -> "1"
             val = int(float(s))
             clean_ids.append(str(val))
         except:
@@ -123,30 +133,34 @@ def clean_id_list(raw_input):
     return clean_ids
 
 def reset_draft():
-    """Setzt das Formular auf 'Neu' zurück"""
     st.session_state.gig_draft = {
-        "event_id": None,
-        "datum": datetime.date.today(),
-        "uhrzeit": datetime.time(19, 0),
-        "ensemble": "Tutti",
-        "location_selection": "Bitte wählen...", 
-        "new_loc_data": {},
-        "selected_songs": []
+        "event_id": None, "datum": datetime.date.today(), "uhrzeit": datetime.time(19, 0),
+        "ensemble": "Tutti", "location_selection": "Bitte wählen...", 
+        "new_loc_data": {}, "selected_songs": []
     }
 
 # --- SPEICHER FUNKTIONEN ---
 
-def save_song_direct(titel, kn, kv, bn, bv, dauer, verlag):
-    try:
-        ws = sh.worksheet("Repertoire")
+def save_song_direct(mode, song_id, titel, kn, kv, bn, bv, dauer, verlag):
+    ws = sh.worksheet("Repertoire")
+    if mode == "Neu":
         col_ids = ws.col_values(1)[1:] 
         ids = [int(x) for x in col_ids if str(x).isdigit()]
         new_id = max(ids) + 1 if ids else 1
         row = [new_id, titel, kn, kv, bn, bv, dauer, verlag, "U-Musik", ""]
         ws.append_row(row)
-        clear_all_caches()
-        return True
-    except: return False
+        msg = f"'{titel}' angelegt!"
+    else: # Edit
+        try:
+            cell = ws.find(str(song_id), in_column=1)
+            r = cell.row
+            # Update Titel bis Verlag (B bis H)
+            ws.update(f"B{r}:H{r}", [[titel, kn, kv, bn, bv, dauer, verlag]])
+            msg = f"'{titel}' aktualisiert!"
+        except: return False, "Fehler beim Update"
+    
+    clear_all_caches()
+    return True, msg
 
 def save_location_direct(name, strasse, plz, stadt):
     ws = sh.worksheet("Locations")
@@ -166,7 +180,6 @@ def update_event_in_db(event_id, row_data):
         clear_all_caches()
         return True
     except Exception as e:
-        st.error(f"Fehler: {e}")
         return False
 
 # --- NAVIGATION ---
@@ -199,7 +212,7 @@ if st.session_state.page == "speichern":
     df_rep = get_data_repertoire()
     df_events = get_data_events()
     
-    # --- EDITIER-FUNKTION (Nur zeigen wenn im Modus NEU) ---
+    # --- EDITIER-FUNKTION ---
     if st.session_state.gig_draft["event_id"] is None:
         with st.expander("🛠 Bereits gespeicherten Auftritt bearbeiten", expanded=False):
             if not df_events.empty:
@@ -219,30 +232,37 @@ if st.session_state.page == "speichern":
                         st.session_state.gig_draft["ensemble"] = row['Ensemble']
                         st.session_state.gig_draft["location_selection"] = row['Location_Name']
                         
-                        # ID WASCHMASCHINE HIER EINSETZEN
+                        # --- CLEANING & RESTORE ---
                         saved_ids = clean_id_list(row['Songs_IDs'])
-
                         restored_labels = []
+                        found_count = 0
+                        
                         if not df_rep.empty:
                             df_rep['Label'] = df_rep.apply(lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})", axis=1)
+                            # ID Mapping strikt als String
                             id_to_label = dict(zip(df_rep['ID'].astype(str), df_rep['Label']))
                             
                             for sid in saved_ids:
                                 if sid in id_to_label:
                                     restored_labels.append(id_to_label[sid])
-                                    
+                                    found_count += 1
+                        
                         st.session_state.gig_draft["selected_songs"] = restored_labels
-                        st.toast("Geladen!", icon="✏️"); time.sleep(0.5); st.rerun()
+                        
+                        if found_count < len(saved_ids):
+                            st.warning(f"Achtung: {found_count} von {len(saved_ids)} Songs gefunden. (Datenbank-Abweichung)")
+                        else:
+                            st.toast("Erfolgreich geladen!", icon="✅")
+                            
+                        time.sleep(1); st.rerun()
             else:
                 st.info("Keine gespeicherten Auftritte.")
 
-    # --- HEADER & ZURÜCK BUTTON ---
+    # --- HEADER & ZURÜCK ---
     if st.session_state.gig_draft["event_id"]:
-        # Spalten für Header und Zurück Button
         col_back, col_head = st.columns([1, 3])
         if col_back.button("⬅️ Zurück / Neu"):
-            reset_draft()
-            st.rerun()
+            reset_draft(); st.rerun()
         col_head.header(f"✏️ Bearbeiten (ID: {st.session_state.gig_draft['event_id']})")
     else:
         st.header("📝 Neuen Auftritt erfassen")
@@ -298,7 +318,7 @@ if st.session_state.page == "speichern":
             q_ver = st.text_input("Verlag")
             if st.form_submit_button("Schnell speichern"):
                 if q_tit and q_kn:
-                    save_song_direct(q_tit, q_kn, q_kv, q_bn, q_bv, q_dur, q_ver)
+                    save_song_direct("Neu", None, q_tit, q_kn, q_kv, q_bn, q_bv, q_dur, q_ver)
                     st.toast(f"'{q_tit}' hinzugefügt!", icon="✅"); time.sleep(1); st.rerun()
                 else: st.error("Pflichtfelder fehlen.")
 
@@ -334,7 +354,6 @@ if st.session_state.page == "speichern":
                     row = df_rep[df_rep['Label'] == label].iloc[0]
                     song_ids.append(str(row['ID']))
                 
-                # Sauber joinen (keine Leerzeichen)
                 row_data = [
                     datum_str, time_str, st.session_state.gig_draft["ensemble"],
                     final_loc_data["Name"], final_loc_data["Strasse"], str(final_loc_data["PLZ"]), final_loc_data["Stadt"],
@@ -354,27 +373,75 @@ if st.session_state.page == "speichern":
                     msg = "Gespeichert!"
                 
                 if success:
-                    st.balloons()
-                    st.success(f"{msg} Setlist: {dateiname}")
-                    reset_draft()
-                    time.sleep(2); st.rerun()
-
+                    st.balloons(); st.success(f"{msg} Setlist: {dateiname}")
+                    reset_draft(); time.sleep(2); st.rerun()
     else: st.warning("Repertoire leer.")
 
 # ==========================================
-# ANDERE SEITEN
+# SEITE 2: REPERTOIRE (NEU: SUCHE & EDIT)
 # ==========================================
 elif st.session_state.page == "repertoire":
-    st.subheader("Repertoire")
-    with st.form("simple_rep"):
-        c1, c2 = st.columns([3,1])
-        t = c1.text_input("Titel"); d = c2.text_input("Dauer", "03:00")
-        k = st.text_input("Komponist NN")
-        if st.form_submit_button("Speichern"):
-            save_song_direct(t, k, "", "", "", d, "")
-            st.success("OK"); time.sleep(1); st.rerun()
-    st.dataframe(get_data_repertoire(), use_container_width=True)
+    st.subheader("Repertoire verwalten")
+    
+    rep_mode = st.radio("Modus:", ["Neu anlegen", "Bearbeiten"], horizontal=True)
+    df_rep = get_data_repertoire()
 
+    # --- DATEN VORBEREITEN ---
+    if rep_mode == "Bearbeiten":
+        if not df_rep.empty:
+            df_rep['Label'] = df_rep.apply(lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})", axis=1)
+            search_rep = st.selectbox("Stück suchen & laden:", df_rep['Label'].tolist(), index=None, placeholder="Tippen zum Suchen...")
+            
+            # Lade Daten in den State, wenn Auswahl getroffen
+            if search_rep:
+                row = df_rep[df_rep['Label'] == search_rep].iloc[0]
+                # Nur laden, wenn wir nicht schon denselben geladen haben (um edits nicht zu überschreiben)
+                if st.session_state.rep_edit_state["id"] != row['ID']:
+                    st.session_state.rep_edit_state = {
+                        "id": row['ID'], "titel": row['Titel'], "dauer": str(row['Dauer']),
+                        "kn": row['Komponist_Nachname'], "kv": row['Komponist_Vorname'],
+                        "bn": row['Bearbeiter_Nachname'], "bv": row['Bearbeiter_Vorname'],
+                        "verlag": row['Verlag']
+                    }
+        else:
+            st.warning("Liste leer.")
+
+    elif rep_mode == "Neu anlegen":
+        # Reset State für Neu
+        if st.session_state.rep_edit_state["id"] is not None:
+             st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "03:00", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
+
+    # --- DAS FORMULAR ---
+    with st.form("rep_form"):
+        s = st.session_state.rep_edit_state
+        c1, c2 = st.columns([3,1])
+        t = c1.text_input("Titel", value=s["titel"])
+        d = c2.text_input("Dauer", value=s["dauer"])
+        c3, c4 = st.columns(2)
+        kn = c3.text_input("Komponist NN", value=s["kn"])
+        kv = c4.text_input("Komponist VN", value=s["kv"])
+        c5, c6 = st.columns(2)
+        bn = c5.text_input("Bearbeiter NN", value=s["bn"])
+        bv = c6.text_input("Bearbeiter VN", value=s["bv"])
+        ver = st.text_input("Verlag", value=s["verlag"])
+        
+        if st.form_submit_button("Speichern"):
+            mode_arg = "Edit" if s["id"] else "Neu"
+            success, msg = save_song_direct(mode_arg, s["id"], t, kn, kv, bn, bv, d, ver)
+            if success:
+                st.success(msg)
+                # Reset
+                st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
+                time.sleep(1); st.rerun()
+            else:
+                st.error("Fehler.")
+    
+    st.divider()
+    st.dataframe(df_rep, use_container_width=True)
+
+# ==========================================
+# REST (Orte / Archiv)
+# ==========================================
 elif st.session_state.page == "orte":
     st.subheader("Locations")
     with st.form("new_loc"):
