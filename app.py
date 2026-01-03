@@ -8,6 +8,7 @@ import datetime
 import time
 import os
 import openpyxl
+from openpyxl.cell.cell import MergedCell # WICHTIG FÜR DEN FIX
 
 # --- KONFIGURATION ---
 DB_NAME = "GEMA_Datenbank"
@@ -39,12 +40,11 @@ try:
     client, drive_service = get_gspread_client()
     sh = client.open(DB_NAME)
 except Exception as e:
-    st.error(f"Verbindungsfehler zur Datenbank: {e}"); st.stop()
+    st.error(f"Verbindungsfehler: {e}"); st.stop()
 
-# --- DRIVE HELPER (ROBUST) ---
+# --- DRIVE HELPER ---
 
 def get_folder_id(folder_name):
-    """Sucht Ordner-ID. Ignoriert Trash."""
     query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     results = drive_service.files().list(q=query, fields="files(id, name)").execute()
     items = results.get('files', [])
@@ -52,62 +52,74 @@ def get_folder_id(folder_name):
     return None
 
 def list_files_in_templates():
-    """Gibt eine Liste aller Dateien im Templates-Ordner zurück"""
     fid = get_folder_id("Templates")
-    if not fid:
-        return [], "Ordner 'Templates' nicht gefunden!"
-    
+    if not fid: return [], "Ordner 'Templates' nicht gefunden!"
     query = f"'{fid}' in parents and trashed = false"
     results = drive_service.files().list(q=query, fields="files(id, name)").execute()
-    files = results.get('files', [])
-    return files, None # Liste von dicts {'id': '...', 'name': '...'}
+    return results.get('files', []), None
 
 def download_specific_template(file_id, filename_save_as):
-    """Lädt eine spezifische Datei anhand ID herunter"""
     try:
         content = drive_service.files().get_media(fileId=file_id).execute()
-        with open(filename_save_as, "wb") as f:
-            f.write(content)
+        with open(filename_save_as, "wb") as f: f.write(content)
         return True, None
-    except Exception as e:
-        return False, str(e)
+    except Exception as e: return False, str(e)
+
+# --- EXCEL HELPER (DER FIX) ---
+
+def safe_write(ws, row, col, value):
+    """Schreibt in eine Zelle, auch wenn sie verbunden ist."""
+    cell = ws.cell(row=row, column=col)
+    if isinstance(cell, MergedCell):
+        # Wenn Zelle teil eines Verbunds ist: Finde den "Parent" (oben links)
+        for merged_range in ws.merged_cells.ranges:
+            if cell.coordinate in merged_range:
+                # Wir schreiben in die Top-Left Zelle des Verbunds
+                top_left = ws.cell(row=merged_range.min_row, column=merged_range.min_col)
+                top_left.value = value
+                break
+    else:
+        cell.value = value
 
 def generate_and_upload_excel(template_file_id, datum, uhrzeit, ensemble, ort_data, songs_list, filename):
-    # 1. Template laden
     local_temp = "temp_template.xlsx"
     ok, err = download_specific_template(template_file_id, local_temp)
     if not ok: return None, f"Download Fehler: {err}"
 
-    # 2. Excel befüllen
     try:
         wb = openpyxl.load_workbook(local_temp)
         ws = wb.active 
         
-        # Header schreiben (Anpassung auf Zeile 1-13)
-        ws['B1'] = ensemble 
-        ws['B2'] = datum 
-        ws['B3'] = ort_data.get('Stadt', '')
+        # Header schreiben
+        safe_write(ws, 1, 2, ensemble) # B1
+        safe_write(ws, 2, 2, datum)    # B2
+        safe_write(ws, 3, 2, ort_data.get('Stadt', '')) # B3
         
         start_row = 14
         current_row = start_row
         
-        # Zeilen leeren (bis 100)
+        # --- 1. LEEREN (Robust gegen Merged Cells) ---
         for row in ws.iter_rows(min_row=start_row, max_row=100):
-            for cell in row: cell.value = None
+            for cell in row:
+                # WICHTIG: Nicht versuchen, MergedCells zu leeren!
+                if isinstance(cell, MergedCell):
+                    continue
+                cell.value = None
 
+        # --- 2. BEFÜLLEN (Mit safe_write) ---
         for song in songs_list:
-            ws.cell(row=current_row, column=2, value=song['Titel']) # B
-            ws.cell(row=current_row, column=5, value=song['Dauer']) # E
+            safe_write(ws, current_row, 2, song['Titel']) # B
+            safe_write(ws, current_row, 5, song['Dauer']) # E
             
             k_name = f"{song['Komponist_Nachname']}, {song['Komponist_Vorname']}"
-            ws.cell(row=current_row, column=6, value=k_name) # F
+            safe_write(ws, current_row, 6, k_name) # F
             
             if song['Bearbeiter_Nachname']:
                 b_name = f"{song['Bearbeiter_Nachname']}, {song['Bearbeiter_Vorname']}"
-                ws.cell(row=current_row, column=16, value=b_name) # P
+                safe_write(ws, current_row, 16, b_name) # P
             
-            ws.cell(row=current_row, column=10, value=song['Verlag']) # J
-            ws.cell(row=current_row, column=11, value="Live") # K
+            safe_write(ws, current_row, 10, song['Verlag']) # J
+            safe_write(ws, current_row, 11, "Live") # K
             
             current_row += 1
             
@@ -116,28 +128,32 @@ def generate_and_upload_excel(template_file_id, datum, uhrzeit, ensemble, ort_da
     except Exception as e:
         return None, f"Excel Schreibfehler: {e}"
 
-    # 3. Upload
+    # Upload
     try:
         output_folder_id = get_folder_id("Output")
         if not output_folder_id:
-            # Versuch im Root zu erstellen, falls GEMA Bpol nicht gefunden wird
-            file_metadata = {'name': 'Output', 'mimeType': 'application/vnd.google-apps.folder'}
-            folder = drive_service.files().create(body=file_metadata, fields='id').execute()
-            output_folder_id = folder.get('id')
+            parent_id = get_folder_id("GEMA Bpol")
+            if parent_id:
+                file_metadata = {'name': 'Output', 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}
+                folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+                output_folder_id = folder.get('id')
+            else:
+                # Notfall: Root
+                file_metadata = {'name': 'Output', 'mimeType': 'application/vnd.google-apps.folder'}
+                folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+                output_folder_id = folder.get('id')
 
         file_metadata = {'name': filename, 'parents': [output_folder_id]}
         media = MediaFileUpload(filename, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         
         file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
         
-        # Aufräumen
         if os.path.exists(local_temp): os.remove(local_temp)
         if os.path.exists(filename): os.remove(filename)
         
         return file.get('webViewLink'), None
     except Exception as e:
         return None, f"Upload Fehler: {e}"
-
 
 # --- DB FUNKTIONEN ---
 def check_and_fix_db():
@@ -331,30 +347,22 @@ if st.session_state.page == "speichern":
         selection = st.multiselect("Suche:", options=df_rep['Label'].tolist(), key="gig_song_selector")
         
         st.markdown("---")
-        
-        # --- TEMPLATE AUSWAHL (NEU) ---
         files_found, err_msg = list_files_in_templates()
-        if err_msg:
-            st.error(f"⚠️ {err_msg}")
-            selected_template_id = None
-        elif not files_found:
-            st.error("⚠️ Ordner 'Templates' ist leer! Bitte Excel-Datei hochladen.")
-            selected_template_id = None
+        if err_msg: st.error(f"⚠️ {err_msg}"); selected_template_id = None
+        elif not files_found: st.error("⚠️ 'Templates' Ordner ist leer!"); selected_template_id = None
         else:
             file_options = {f['name']: f['id'] for f in files_found}
-            # Standardmäßig das erste, oder wenn "Setlist" im Namen ist
             default_idx = 0
             for i, fname in enumerate(file_options.keys()):
                 if "setlist" in fname.lower(): default_idx = i; break
-            
-            selected_template_name = st.selectbox("Vorlage für Excel-Erstellung:", list(file_options.keys()), index=default_idx)
-            selected_template_id = file_options[selected_template_name]
+            sel_temp_name = st.selectbox("Vorlage:", list(file_options.keys()), index=default_idx)
+            selected_template_id = file_options[sel_temp_name]
 
         btn_txt = "🔄 Aktualisieren & Excel neu erstellen" if st.session_state.gig_draft["event_id"] else "✅ Final speichern & Excel erstellen"
         
         if st.button(btn_txt, type="primary", use_container_width=True):
             if not final_loc.get("Name") or not selection or not selected_template_id:
-                st.error("Ort, Programm oder Template fehlt!")
+                st.error("Daten fehlen!")
             else:
                 if sel_loc == "➕ Neuer Ort...":
                     save_location_direct(final_loc["Name"], final_loc["Strasse"], final_loc["PLZ"], final_loc["Stadt"])
@@ -370,28 +378,20 @@ if st.session_state.page == "speichern":
                     song_ids.append(str(row['ID']))
                     selected_songs_data.append(row.to_dict())
                 
-                with st.spinner("Erstelle Excel-Datei und lade hoch..."):
+                with st.spinner("Erstelle Excel..."):
                     web_link, err = generate_and_upload_excel(selected_template_id, datum_str, time_str, st.session_state.gig_draft['ensemble'], final_loc, selected_songs_data, dateiname)
                     
-                    if err:
-                        st.error(f"⚠️ {err}")
+                    if err: st.error(f"⚠️ {err}")
                     else:
-                        row_data = [
-                            datum_str, time_str, st.session_state.gig_draft["ensemble"],
-                            final_loc["Name"], final_loc["Strasse"], str(final_loc["PLZ"]), final_loc["Stadt"],
-                            dateiname, ",".join(song_ids), web_link
-                        ]
-                        
-                        if st.session_state.gig_draft["event_id"]:
-                            update_event_in_db(st.session_state.gig_draft["event_id"], row_data)
+                        row_data = [datum_str, time_str, st.session_state.gig_draft["ensemble"], final_loc["Name"], final_loc["Strasse"], str(final_loc["PLZ"]), final_loc["Stadt"], dateiname, ",".join(song_ids), web_link]
+                        if st.session_state.gig_draft["event_id"]: update_event_in_db(st.session_state.gig_draft["event_id"], row_data)
                         else:
                             ws_ev = sh.worksheet("Events"); col_ids = ws_ev.col_values(1)[1:]
                             e_ids = [int(x) for x in col_ids if str(x).isdigit()]
                             new_ev_id = max(e_ids) + 1 if e_ids else 1
                             ws_ev.append_row([new_ev_id] + row_data)
                             clear_all_caches()
-                        
-                        st.balloons(); st.success(f"Fertig! Datei erstellt: {dateiname}"); reset_draft(); time.sleep(3); st.rerun()
+                        st.balloons(); st.success(f"Fertig: {dateiname}"); reset_draft(); time.sleep(3); st.rerun()
     else: st.warning("Repertoire leer.")
 
 # === SEITE 2: REPERTOIRE ===
