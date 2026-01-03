@@ -3,6 +3,7 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 import datetime
 import time
 import os
@@ -15,19 +16,32 @@ DB_NAME = "GEMA_Datenbank"
 
 st.set_page_config(page_title="GEMA Manager", page_icon="xj", layout="centered")
 
-# --- SESSION STATE ---
-if 'gig_draft' not in st.session_state:
+# --- INITIALISIERUNG & RESET-LOGIK (WICHTIG: GANZ OBEN) ---
+
+# Hilfsfunktion zum Zurücksetzen
+def reset_draft_logic():
     st.session_state.gig_draft = {
         "event_id": None, "datum": datetime.date.today(), "uhrzeit": datetime.time(19, 0),
         "ensemble": "Tutti", "location_selection": "Bitte wählen...", 
         "new_loc_data": {}
     }
+    st.session_state.gig_song_selector = []
+    st.session_state.last_download = None
+
+# 1. State Variablen initialisieren
+if 'gig_draft' not in st.session_state: reset_draft_logic()
 if 'gig_song_selector' not in st.session_state: st.session_state.gig_song_selector = []
 if 'rep_edit_state' not in st.session_state: st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
 if 'page' not in st.session_state: st.session_state.page = "speichern"
 if 'db_checked' not in st.session_state: st.session_state.db_checked = False
-# NEU: Speicher für den Download
 if 'last_download' not in st.session_state: st.session_state.last_download = None
+if 'trigger_reset' not in st.session_state: st.session_state.trigger_reset = False
+
+# 2. Prüfen, ob ein Reset angefordert wurde (Der Fix für den Fehler!)
+if st.session_state.trigger_reset:
+    reset_draft_logic()
+    st.session_state.trigger_reset = False
+    st.rerun()
 
 @st.cache_resource
 def get_gspread_client():
@@ -44,7 +58,7 @@ try:
 except Exception as e:
     st.error(f"Verbindungsfehler: {e}"); st.stop()
 
-# --- DRIVE & EXCEL HELPER ---
+# --- HELPER FUNKTIONEN ---
 
 def get_folder_id(folder_name):
     query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -80,7 +94,6 @@ def safe_write(ws, row, col, value):
         cell.value = value
 
 def generate_excel_bytes(template_file_id, datum, uhrzeit, ensemble, ort_data, songs_list):
-    # 1. Template in Speicher laden
     template_stream, err = download_specific_template(template_file_id)
     if err: return None, f"Download Fehler: {err}"
 
@@ -88,7 +101,7 @@ def generate_excel_bytes(template_file_id, datum, uhrzeit, ensemble, ort_data, s
         wb = openpyxl.load_workbook(template_stream)
         ws = wb.active 
         
-        # Header
+        # Header (Anpassbar)
         safe_write(ws, 1, 2, ensemble)
         safe_write(ws, 2, 2, datum)
         safe_write(ws, 3, 2, ort_data.get('Stadt', ''))
@@ -96,12 +109,10 @@ def generate_excel_bytes(template_file_id, datum, uhrzeit, ensemble, ort_data, s
         start_row = 14
         current_row = start_row
         
-        # Leeren
         for row in ws.iter_rows(min_row=start_row, max_row=100):
             for cell in row:
                 if not isinstance(cell, MergedCell): cell.value = None
 
-        # Füllen
         for song in songs_list:
             safe_write(ws, current_row, 2, song['Titel'])
             safe_write(ws, current_row, 5, song['Dauer'])
@@ -114,7 +125,6 @@ def generate_excel_bytes(template_file_id, datum, uhrzeit, ensemble, ort_data, s
             safe_write(ws, current_row, 11, "Live")
             current_row += 1
             
-        # Speichern in Bytes (nicht auf Festplatte)
         output = BytesIO()
         wb.save(output)
         output.seek(0)
@@ -187,10 +197,6 @@ def clean_id_list_from_string(raw_input):
         except: clean.append(s)
     return clean
 
-def reset_draft():
-    st.session_state.gig_draft = {"event_id": None, "datum": datetime.date.today(), "uhrzeit": datetime.time(19, 0), "ensemble": "Tutti", "location_selection": "Bitte wählen...", "new_loc_data": {}}
-    st.session_state.gig_song_selector = []
-
 def save_song_direct(mode, song_id, titel, kn, kv, bn, bv, dauer, verlag):
     ws = sh.worksheet("Repertoire")
     if mode == "Neu":
@@ -252,7 +258,7 @@ if st.session_state.page == "speichern":
         d_name, d_bytes = st.session_state.last_download
         st.success("🎉 Datei wurde erfolgreich erstellt!")
         st.download_button(
-            label=f"📥 {d_name} jetzt herunterladen",
+            label=f"📥 {d_name} herunterladen",
             data=d_bytes,
             file_name=d_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -281,13 +287,13 @@ if st.session_state.page == "speichern":
                         rows = df_rep[df_rep['ID'].isin(saved_ids)]
                         restored_labels = rows['Label'].tolist()
                     st.session_state.gig_song_selector = restored_labels
-                    st.session_state.last_download = None # Reset Download bei neuem Laden
+                    st.session_state.last_download = None 
                     st.toast("Geladen!", icon="✏️"); time.sleep(0.5); st.rerun()
 
     if st.session_state.gig_draft["event_id"]:
         cb, ch = st.columns([1,3])
-        if cb.button("⬅️ Zurück"): 
-            reset_draft(); st.session_state.last_download = None; st.rerun()
+        # ZURÜCK BUTTON FIX (on_click verwendet die Reset-Logik direkt)
+        cb.button("⬅️ Zurück", on_click=reset_draft_logic) 
         ch.header(f"✏️ Bearbeiten (ID: {st.session_state.gig_draft['event_id']})")
     else: st.header("📝 Neuen Auftritt erfassen")
 
@@ -346,7 +352,6 @@ if st.session_state.page == "speichern":
             if not final_loc.get("Name") or not selection or not selected_template_id:
                 st.error("Daten fehlen!")
             else:
-                # 1. Ort ggf. speichern
                 if sel_loc == "➕ Neuer Ort...":
                     save_location_direct(final_loc["Name"], final_loc["Strasse"], final_loc["PLZ"], final_loc["Stadt"])
                 
@@ -362,17 +367,15 @@ if st.session_state.page == "speichern":
                     selected_songs_data.append(row.to_dict())
                 
                 with st.spinner("Erstelle Excel-Datei..."):
-                    # Excel generieren (BYTES, kein Upload!)
                     excel_bytes, err = generate_excel_bytes(selected_template_id, datum_str, time_str, st.session_state.gig_draft['ensemble'], final_loc, selected_songs_data)
                     
                     if err:
                         st.error(f"⚠️ {err}")
                     else:
-                        # DB Update
                         row_data = [
                             datum_str, time_str, st.session_state.gig_draft["ensemble"],
                             final_loc["Name"], final_loc["Strasse"], str(final_loc["PLZ"]), final_loc["Stadt"],
-                            dateiname, ",".join(song_ids), "Lokal" # Kein Web-Link möglich
+                            dateiname, ",".join(song_ids), "Lokal"
                         ]
                         
                         if st.session_state.gig_draft["event_id"]: update_event_in_db(st.session_state.gig_draft["event_id"], row_data)
@@ -383,13 +386,15 @@ if st.session_state.page == "speichern":
                             ws_ev.append_row([new_ev_id] + row_data)
                             clear_all_caches()
                         
-                        # Download vorbereiten
+                        # Datei für Download speichern
                         st.session_state.last_download = (dateiname, excel_bytes.getvalue())
-                        reset_draft()
+                        
+                        # RESET ÜBER FLAGGE (Der Fix!)
+                        st.session_state.trigger_reset = True
                         st.rerun()
     else: st.warning("Repertoire leer.")
 
-# === SEITE 2,3,4 (Identisch) ===
+# === SEITE 2,3,4 (Gleich) ===
 elif st.session_state.page == "repertoire":
     st.subheader("Repertoire verwalten")
     mode = st.radio("Modus:", ["Neu", "Bearbeiten"], horizontal=True)
@@ -431,6 +436,5 @@ elif st.session_state.page == "archiv":
                     for _, row in df_y[df_y['Datum_Obj'].dt.month == m].iterrows():
                         c1, c2 = st.columns([3, 1])
                         c1.write(f"**{row['Datum']}** | {row['Location_Name']} ({row['Ensemble']})"); c1.caption(f"Datei: {row['Setlist_Name']}")
-                        # Kein View Link mehr, da lokal
                         c2.caption("Lokal gespeichert")
                         st.divider()
