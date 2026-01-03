@@ -12,9 +12,19 @@ DB_NAME = "GEMA_Datenbank"
 # --- SETUP & VERBINDUNG ---
 st.set_page_config(page_title="GEMA Manager", page_icon="xj", layout="centered")
 
-# Session State für Navigation initialisieren
+# Session State initialisieren (Das Gedächtnis der App)
 if 'page' not in st.session_state:
-    st.session_state.page = "repertoire"
+    st.session_state.page = "planer" # Startseite
+
+# Cache für den Planer initialisieren (falls noch nicht da)
+if 'planer_cache' not in st.session_state:
+    st.session_state.planer_cache = {
+        "datum": datetime.date.today(),
+        "ensemble": "Tutti",
+        "ort": "Eschwege",
+        "selected_songs": [], # Hier merken wir uns die Lieder
+        "search_term": ""
+    }
 
 @st.cache_resource
 def get_gspread_client():
@@ -75,7 +85,6 @@ def load_events():
     ws = sh.worksheet("Events")
     data = ws.get_all_records()
     df = pd.DataFrame(data)
-    # Datumsformat sicherstellen
     if not df.empty and 'Datum' in df.columns:
         df['Datum_Obj'] = pd.to_datetime(df['Datum'], format="%d.%m.%Y", errors='coerce')
     return df
@@ -104,6 +113,8 @@ def navigation_bar():
     st.markdown("---")
     c1, c2, c3 = st.columns(3)
     
+    # Wir speichern NICHT hier, sondern direkt bei Eingabe im Widget (on_change ist nicht nötig, wir lesen session_state)
+    
     if c1.button("🎵 Repertoire", use_container_width=True):
         st.session_state.page = "repertoire"
         st.rerun()
@@ -119,12 +130,10 @@ def navigation_bar():
 
 # --- HAUPTPROGRAMM ---
 
-# DB Check im Hintergrund
 check_and_fix_db()
 
 st.title("Orchester Manager 🎻")
 
-# Menü anzeigen
 navigation_bar()
 
 # SEITE: REPERTOIRE
@@ -136,16 +145,13 @@ if st.session_state.page == "repertoire":
     f_id = None
     default_vals = {"titel": "", "kn": "", "kv": "", "bn": "", "bv": "", "dauer": "03:00", "verlag": ""}
     
-    # --- LOGIK FÜR BEARBEITEN MIT SUCHE ---
     if mode == "Bearbeiten":
         df_rep = load_repertoire()
         if not df_rep.empty:
             df_rep['Label'] = df_rep.apply(lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})", axis=1)
             
-            # 1. Suchfilter
             search_term = st.text_input("🔍 Titel suchen:", placeholder="Tippe zum Filtern...")
             
-            # 2. Liste filtern
             if search_term:
                 filtered_df = df_rep[df_rep['Label'].str.contains(search_term, case=False)]
             else:
@@ -170,7 +176,6 @@ if st.session_state.page == "repertoire":
             st.warning("Datenbank leer.")
             st.stop()
 
-    # --- FORMULAR ---
     with st.form("song_form", clear_on_submit=(mode=="Neu anlegen")):
         st.caption(f"Modus: {mode}")
         c1, c2 = st.columns([3, 1])
@@ -204,11 +209,29 @@ if st.session_state.page == "repertoire":
 elif st.session_state.page == "planer":
     st.subheader("Auftritt planen")
     
-    col_a, col_b = st.columns(2)
-    inp_date = col_a.date_input("Datum", datetime.date.today())
-    inp_ens = col_b.selectbox("Ensemble", ["Tutti", "BQ", "Quartett", "Duo"])
-    inp_ort = st.text_input("Ort", "Eschwege")
+    # 1. DATEN LADEN / CACHE UPDATEN
+    # Wir benutzen den Cache als 'value', schreiben aber Änderungen sofort zurück
     
+    col_a, col_b = st.columns(2)
+    
+    # Datum
+    new_date = col_a.date_input("Datum", value=st.session_state.planer_cache["datum"])
+    st.session_state.planer_cache["datum"] = new_date
+    
+    # Ensemble
+    ens_options = ["Tutti", "BQ", "Quartett", "Duo"]
+    # Sicherstellen, dass der gecachte Wert noch gültig ist (falls man Optionen ändert)
+    default_ens = st.session_state.planer_cache["ensemble"]
+    if default_ens not in ens_options: default_ens = "Tutti"
+    
+    new_ens = col_b.selectbox("Ensemble", ens_options, index=ens_options.index(default_ens))
+    st.session_state.planer_cache["ensemble"] = new_ens
+    
+    # Ort
+    new_ort = st.text_input("Ort", value=st.session_state.planer_cache["ort"])
+    st.session_state.planer_cache["ort"] = new_ort
+    
+    # 2. SONG AUSWAHL
     df_rep = load_repertoire()
     
     if not df_rep.empty and 'Titel' in df_rep.columns:
@@ -217,24 +240,52 @@ elif st.session_state.page == "planer":
             axis=1
         )
         
-        # Filter für die Setlist-Auswahl
         st.write("Programm zusammenstellen:")
-        search_filter = st.text_input("🔎 Repertoire durchsuchen:", placeholder="Suchbegriff eingeben...", key="search_planner")
         
-        options = df_rep['Label'].tolist()
+        # Suche im Cache speichern
+        search_filter = st.text_input("🔎 Repertoire durchsuchen:", 
+                                      value=st.session_state.planer_cache["search_term"],
+                                      placeholder="Suchbegriff eingeben...")
+        st.session_state.planer_cache["search_term"] = search_filter
+        
+        all_options = df_rep['Label'].tolist()
+        
+        # Validierung: Prüfen, ob die im Cache gespeicherten Songs noch in der DB existieren
+        # (Falls du im Repertoire was umbenannt hast)
+        valid_cached_songs = [s for s in st.session_state.planer_cache["selected_songs"] if s in all_options]
+        
+        # Filterlogik für die Anzeige
         if search_filter:
-            # Filtern der Optionen basierend auf Suche
-            options = [opt for opt in options if search_filter.lower() in opt.lower()]
+            filtered_options = [opt for opt in all_options if search_filter.lower() in opt.lower()]
+        else:
+            filtered_options = all_options
             
-        selected_labels = st.multiselect("Auswahl (Reihenfolge!):", options)
+        # Multiselect
+        # Wichtig: "default" sind die bereits gewählten (validen) Songs
+        # Wir müssen sicherstellen, dass die 'default' Werte auch in den 'options' enthalten sind
+        # Trick: Wir kombinieren gefilterte Optionen mit den bereits gewählten, damit nichts abstürzt
+        display_options = list(set(filtered_options + valid_cached_songs))
+        
+        # Sortieren für bessere Optik
+        display_options.sort()
+        
+        new_selection = st.multiselect(
+            "Auswahl (Reihenfolge!):", 
+            options=display_options,
+            default=valid_cached_songs
+        )
+        
+        # SOFORT im Cache speichern
+        st.session_state.planer_cache["selected_songs"] = new_selection
+        
+        st.markdown("---")
         
         if st.button("🚀 Setliste speichern", use_container_width=True):
-            datum_str = inp_date.strftime("%d.%m.%Y")
-            dateiname = f"{inp_ens}{datum_str}{inp_ort}Setlist.xlsx"
+            datum_str = new_date.strftime("%d.%m.%Y")
+            dateiname = f"{new_ens}{datum_str}{new_ort}Setlist.xlsx"
             
             song_ids = []
-            # Achtung: Wir müssen die IDs aus dem originalen DF holen
-            for label in selected_labels:
+            for label in new_selection:
                 row = df_rep[df_rep['Label'] == label].iloc[0]
                 song_ids.append(str(row['ID']))
             
@@ -242,15 +293,22 @@ elif st.session_state.page == "planer":
             ws_ev.append_row([
                 str(datetime.datetime.now()), 
                 datum_str, 
-                inp_ens, 
-                inp_ort, 
+                new_ens, 
+                new_ort, 
                 dateiname, 
                 ",".join(song_ids)
             ])
             
+            # Cache leeren nach erfolgreichem Speichern?
+            # Macht Sinn, damit man den nächsten Gig planen kann
+            st.session_state.planer_cache["selected_songs"] = []
+            # Ort lassen wir stehen, ist oft gleich
+            
             st.toast(f"Gespeichert!", icon="🎉")
-            st.success(f"Auftritt **{inp_ort}** angelegt.")
+            st.success(f"Auftritt **{new_ort}** angelegt.")
             st.info("ℹ️ Excel-Generierung folgt im nächsten Schritt.")
+            time.sleep(2)
+            st.rerun() # Reload um Formular zu leeren
     else:
         st.info("Repertoire leer.")
 
@@ -261,36 +319,25 @@ elif st.session_state.page == "archiv":
     df_events = load_events()
     
     if not df_events.empty and 'Datum_Obj' in df_events.columns:
-        # Sortieren: Neueste zuerst
         df_events = df_events.sort_values(by='Datum_Obj', ascending=False)
-        
-        # Gruppieren nach Jahr
         years = df_events['Datum_Obj'].dt.year.unique()
         
         for year in years:
             st.markdown(f"### {year}")
             df_year = df_events[df_events['Datum_Obj'].dt.year == year]
-            
-            # Gruppieren nach Monat
             months = df_year['Datum_Obj'].dt.month.unique()
             for month in months:
-                month_name = datetime.date(2000, int(month), 1).strftime('%B') # Monat als Name
+                month_name = datetime.date(2000, int(month), 1).strftime('%B')
                 with st.expander(f"{month_name} ({len(df_year[df_year['Datum_Obj'].dt.month == month])} Auftritte)"):
-                    
-                    # Einzelne Events anzeigen
                     events_month = df_year[df_year['Datum_Obj'].dt.month == month]
                     for idx, row in events_month.iterrows():
-                        col_info, col_link = st.columns([3, 1])
-                        
-                        with col_info:
+                        c_info, c_link = st.columns([3, 1])
+                        with c_info:
                             st.write(f"**{row['Datum']} - {row['Ort']}**")
-                            st.caption(f"Ensemble: {row['Ensemble']} | Datei: {row['Setlist_Name']}")
-                        
-                        with col_link:
-                            # Link zur Drive Suche (da wir keine direkte URL in der DB haben bisher)
+                            st.caption(f"{row['Ensemble']} | {row['Setlist_Name']}")
+                        with c_link:
                             search_url = f"https://drive.google.com/drive/search?q={row['Setlist_Name']}"
                             st.link_button("Öffnen", search_url)
-                        
                         st.divider()
     else:
         st.info("Noch keine Auftritte gespeichert.")
