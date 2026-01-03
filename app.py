@@ -3,12 +3,12 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 import datetime
 import time
 import os
 import openpyxl
-from openpyxl.cell.cell import MergedCell # Wichtig für Excel Fix
+from openpyxl.cell.cell import MergedCell
+from io import BytesIO
 
 # --- KONFIGURATION ---
 DB_NAME = "GEMA_Datenbank"
@@ -26,6 +26,8 @@ if 'gig_song_selector' not in st.session_state: st.session_state.gig_song_select
 if 'rep_edit_state' not in st.session_state: st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
 if 'page' not in st.session_state: st.session_state.page = "speichern"
 if 'db_checked' not in st.session_state: st.session_state.db_checked = False
+# NEU: Speicher für den Download
+if 'last_download' not in st.session_state: st.session_state.last_download = None
 
 @st.cache_resource
 def get_gspread_client():
@@ -40,42 +42,31 @@ try:
     client, drive_service = get_gspread_client()
     sh = client.open(DB_NAME)
 except Exception as e:
-    st.error(f"Verbindungsfehler zur Datenbank: {e}"); st.stop()
+    st.error(f"Verbindungsfehler: {e}"); st.stop()
 
-# --- DRIVE HELPER (Strict Mode) ---
+# --- DRIVE & EXCEL HELPER ---
 
-def get_folder_id_strict(folder_name, parent_id=None):
-    """Sucht Ordner. Wenn parent_id gegeben, muss er darin sein."""
+def get_folder_id(folder_name):
     query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    if parent_id:
-        query += f" and '{parent_id}' in parents"
-    
-    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
-    items = results.get('files', [])
-    if items: return items[0]['id']
+    try:
+        results = drive_service.files().list(q=query, fields="files(id)").execute()
+        items = results.get('files', [])
+        if items: return items[0]['id']
+    except: pass
     return None
 
 def list_files_in_templates():
-    # 1. Hauptordner suchen
-    root_id = get_folder_id_strict("GEMA Bpol")
-    if not root_id: return [], "Hauptordner 'GEMA Bpol' nicht gefunden! Bitte mit Bot teilen."
-    
-    # 2. Templates darin suchen
-    temp_id = get_folder_id_strict("Templates", parent_id=root_id)
-    if not temp_id: return [], "Ordner 'Templates' (innerhalb von GEMA Bpol) nicht gefunden."
-
-    query = f"'{temp_id}' in parents and trashed = false"
+    fid = get_folder_id("Templates")
+    if not fid: return [], "Ordner 'Templates' nicht gefunden."
+    query = f"'{fid}' in parents and trashed = false"
     results = drive_service.files().list(q=query, fields="files(id, name)").execute()
     return results.get('files', []), None
 
-def download_specific_template(file_id, filename_save_as):
+def download_specific_template(file_id):
     try:
         content = drive_service.files().get_media(fileId=file_id).execute()
-        with open(filename_save_as, "wb") as f: f.write(content)
-        return True, None
-    except Exception as e: return False, str(e)
-
-# --- EXCEL HELPER (Fix für verbundene Zellen) ---
+        return BytesIO(content), None
+    except Exception as e: return None, str(e)
 
 def safe_write(ws, row, col, value):
     cell = ws.cell(row=row, column=col)
@@ -88,18 +79,16 @@ def safe_write(ws, row, col, value):
     else:
         cell.value = value
 
-def generate_and_upload_excel(template_file_id, datum, uhrzeit, ensemble, ort_data, songs_list, filename):
-    # 1. Download
-    local_temp = "temp_template.xlsx"
-    ok, err = download_specific_template(template_file_id, local_temp)
-    if not ok: return None, f"Download Fehler: {err}"
+def generate_excel_bytes(template_file_id, datum, uhrzeit, ensemble, ort_data, songs_list):
+    # 1. Template in Speicher laden
+    template_stream, err = download_specific_template(template_file_id)
+    if err: return None, f"Download Fehler: {err}"
 
-    # 2. Excel schreiben
     try:
-        wb = openpyxl.load_workbook(local_temp)
+        wb = openpyxl.load_workbook(template_stream)
         ws = wb.active 
         
-        # Header schreiben (Sicheres Schreiben)
+        # Header
         safe_write(ws, 1, 2, ensemble)
         safe_write(ws, 2, 2, datum)
         safe_write(ws, 3, 2, ort_data.get('Stadt', ''))
@@ -107,57 +96,32 @@ def generate_and_upload_excel(template_file_id, datum, uhrzeit, ensemble, ort_da
         start_row = 14
         current_row = start_row
         
-        # Leeren (Vorsicht mit Merged Cells)
+        # Leeren
         for row in ws.iter_rows(min_row=start_row, max_row=100):
             for cell in row:
-                if not isinstance(cell, MergedCell):
-                    cell.value = None
+                if not isinstance(cell, MergedCell): cell.value = None
 
         # Füllen
         for song in songs_list:
-            safe_write(ws, current_row, 2, song['Titel']) # B
-            safe_write(ws, current_row, 5, song['Dauer']) # E
+            safe_write(ws, current_row, 2, song['Titel'])
+            safe_write(ws, current_row, 5, song['Dauer'])
             k_name = f"{song['Komponist_Nachname']}, {song['Komponist_Vorname']}"
-            safe_write(ws, current_row, 6, k_name) # F
+            safe_write(ws, current_row, 6, k_name)
             if song['Bearbeiter_Nachname']:
                 b_name = f"{song['Bearbeiter_Nachname']}, {song['Bearbeiter_Vorname']}"
-                safe_write(ws, current_row, 16, b_name) # P
-            safe_write(ws, current_row, 10, song['Verlag']) # J
-            safe_write(ws, current_row, 11, "Live") # K
+                safe_write(ws, current_row, 16, b_name)
+            safe_write(ws, current_row, 10, song['Verlag'])
+            safe_write(ws, current_row, 11, "Live")
             current_row += 1
             
-        wb.save(filename)
+        # Speichern in Bytes (nicht auf Festplatte)
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        return output, None
+        
     except Exception as e:
         return None, f"Excel Fehler: {e}"
-
-    # 3. Upload (QUOTA FIX)
-    try:
-        # A) Hauptordner finden
-        root_id = get_folder_id_strict("GEMA Bpol")
-        if not root_id: return None, "Fehler: Ordner 'GEMA Bpol' nicht gefunden. Upload unmöglich."
-        
-        # B) Output Ordner finden (MUSS existieren)
-        output_id = get_folder_id_strict("Output", parent_id=root_id)
-        if not output_id:
-            # Letzter Versuch: Vielleicht heißt er anders oder liegt woanders? Suche global
-            output_id = get_folder_id_strict("Output")
-            if not output_id:
-                return None, "Fehler: Ordner 'Output' nicht gefunden! Bitte erstelle ihn im Ordner 'GEMA Bpol'."
-
-        # C) Upload direkt in den gefundenen Ordner (kein Erstellen!)
-        file_metadata = {'name': filename, 'parents': [output_id]}
-        media = MediaFileUpload(filename, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        
-        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
-        
-        # Cleanup
-        if os.path.exists(local_temp): os.remove(local_temp)
-        if os.path.exists(filename): os.remove(filename)
-        
-        return file.get('webViewLink'), None
-
-    except Exception as e:
-        return None, f"Upload Fehler: {e}"
 
 # --- DB FUNKTIONEN ---
 def check_and_fix_db():
@@ -172,7 +136,7 @@ def check_and_fix_db():
     event_headers = ['Event_ID', 'Datum', 'Uhrzeit', 'Ensemble', 'Location_Name', 'Strasse', 'PLZ', 'Stadt', 'Setlist_Name', 'Songs_IDs', 'File_Link']
     curr = ws_ev.row_values(1)
     if not curr or 'File_Link' not in curr: ws_ev.clear(); ws_ev.update('A1:K1', [event_headers]) 
-
+    
     try: ws_loc = sh.worksheet("Locations")
     except: ws_loc = sh.add_worksheet(title="Locations", rows=50, cols=5)
     loc_headers = ['ID', 'Name', 'Strasse', 'PLZ', 'Stadt']
@@ -283,7 +247,20 @@ if st.session_state.page == "speichern":
     df_rep = get_data_repertoire()
     df_events = get_data_events()
     
-    # Editier-Auswahl
+    # 1. DOWNLOAD BUTTON (Wenn Datei bereitsteht)
+    if st.session_state.last_download:
+        d_name, d_bytes = st.session_state.last_download
+        st.success("🎉 Datei wurde erfolgreich erstellt!")
+        st.download_button(
+            label=f"📥 {d_name} jetzt herunterladen",
+            data=d_bytes,
+            file_name=d_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
+        st.divider()
+
+    # 2. Editier-Auswahl
     if st.session_state.gig_draft["event_id"] is None:
         with st.expander("🛠 Bereits gespeicherten Auftritt bearbeiten", expanded=False):
             if not df_events.empty:
@@ -304,11 +281,13 @@ if st.session_state.page == "speichern":
                         rows = df_rep[df_rep['ID'].isin(saved_ids)]
                         restored_labels = rows['Label'].tolist()
                     st.session_state.gig_song_selector = restored_labels
+                    st.session_state.last_download = None # Reset Download bei neuem Laden
                     st.toast("Geladen!", icon="✏️"); time.sleep(0.5); st.rerun()
 
     if st.session_state.gig_draft["event_id"]:
         cb, ch = st.columns([1,3])
-        if cb.button("⬅️ Zurück"): reset_draft(); st.rerun()
+        if cb.button("⬅️ Zurück"): 
+            reset_draft(); st.session_state.last_download = None; st.rerun()
         ch.header(f"✏️ Bearbeiten (ID: {st.session_state.gig_draft['event_id']})")
     else: st.header("📝 Neuen Auftritt erfassen")
 
@@ -352,8 +331,7 @@ if st.session_state.page == "speichern":
         
         st.markdown("---")
         files_found, err_msg = list_files_in_templates()
-        if err_msg: st.error(f"⚠️ {err_msg}"); selected_template_id = None
-        elif not files_found: st.error("⚠️ 'Templates' Ordner ist leer!"); selected_template_id = None
+        if not files_found: st.error("⚠️ 'Templates' Ordner ist leer!"); selected_template_id = None
         else:
             file_options = {f['name']: f['id'] for f in files_found}
             default_idx = 0
@@ -362,12 +340,13 @@ if st.session_state.page == "speichern":
             sel_temp_name = st.selectbox("Vorlage:", list(file_options.keys()), index=default_idx)
             selected_template_id = file_options[sel_temp_name]
 
-        btn_txt = "🔄 Aktualisieren & Excel neu erstellen" if st.session_state.gig_draft["event_id"] else "✅ Final speichern & Excel erstellen"
+        btn_txt = "🔄 Aktualisieren & Excel erstellen" if st.session_state.gig_draft["event_id"] else "✅ Final speichern & Excel erstellen"
         
         if st.button(btn_txt, type="primary", use_container_width=True):
             if not final_loc.get("Name") or not selection or not selected_template_id:
                 st.error("Daten fehlen!")
             else:
+                # 1. Ort ggf. speichern
                 if sel_loc == "➕ Neuer Ort...":
                     save_location_direct(final_loc["Name"], final_loc["Strasse"], final_loc["PLZ"], final_loc["Stadt"])
                 
@@ -382,12 +361,20 @@ if st.session_state.page == "speichern":
                     song_ids.append(str(row['ID']))
                     selected_songs_data.append(row.to_dict())
                 
-                with st.spinner("Erstelle Excel..."):
-                    web_link, err = generate_and_upload_excel(selected_template_id, datum_str, time_str, st.session_state.gig_draft['ensemble'], final_loc, selected_songs_data, dateiname)
+                with st.spinner("Erstelle Excel-Datei..."):
+                    # Excel generieren (BYTES, kein Upload!)
+                    excel_bytes, err = generate_excel_bytes(selected_template_id, datum_str, time_str, st.session_state.gig_draft['ensemble'], final_loc, selected_songs_data)
                     
-                    if err: st.error(f"⚠️ {err}")
+                    if err:
+                        st.error(f"⚠️ {err}")
                     else:
-                        row_data = [datum_str, time_str, st.session_state.gig_draft["ensemble"], final_loc["Name"], final_loc["Strasse"], str(final_loc["PLZ"]), final_loc["Stadt"], dateiname, ",".join(song_ids), web_link]
+                        # DB Update
+                        row_data = [
+                            datum_str, time_str, st.session_state.gig_draft["ensemble"],
+                            final_loc["Name"], final_loc["Strasse"], str(final_loc["PLZ"]), final_loc["Stadt"],
+                            dateiname, ",".join(song_ids), "Lokal" # Kein Web-Link möglich
+                        ]
+                        
                         if st.session_state.gig_draft["event_id"]: update_event_in_db(st.session_state.gig_draft["event_id"], row_data)
                         else:
                             ws_ev = sh.worksheet("Events"); col_ids = ws_ev.col_values(1)[1:]
@@ -395,10 +382,14 @@ if st.session_state.page == "speichern":
                             new_ev_id = max(e_ids) + 1 if e_ids else 1
                             ws_ev.append_row([new_ev_id] + row_data)
                             clear_all_caches()
-                        st.balloons(); st.success(f"Fertig: {dateiname}"); reset_draft(); time.sleep(3); st.rerun()
+                        
+                        # Download vorbereiten
+                        st.session_state.last_download = (dateiname, excel_bytes.getvalue())
+                        reset_draft()
+                        st.rerun()
     else: st.warning("Repertoire leer.")
 
-# === SEITE 2: REPERTOIRE ===
+# === SEITE 2,3,4 (Identisch) ===
 elif st.session_state.page == "repertoire":
     st.subheader("Repertoire verwalten")
     mode = st.radio("Modus:", ["Neu", "Bearbeiten"], horizontal=True)
@@ -419,7 +410,6 @@ elif st.session_state.page == "repertoire":
             save_song_direct("Edit" if s["id"] else "Neu", s["id"], t, kn, kv, bn, bv, d, v); st.rerun()
     st.dataframe(df_rep, use_container_width=True)
 
-# === SEITE 3: ORTE ===
 elif st.session_state.page == "orte":
     st.subheader("Locations"); df_loc = get_data_locations()
     with st.form("loc"):
@@ -427,7 +417,6 @@ elif st.session_state.page == "orte":
         if st.form_submit_button("Speichern"): save_location_direct(n, "", "", ci); st.rerun()
     st.dataframe(df_loc, use_container_width=True)
 
-# === SEITE 4: ARCHIV ===
 elif st.session_state.page == "archiv":
     st.subheader("📂 Setlist Archiv")
     df_events = get_data_events()
@@ -442,6 +431,6 @@ elif st.session_state.page == "archiv":
                     for _, row in df_y[df_y['Datum_Obj'].dt.month == m].iterrows():
                         c1, c2 = st.columns([3, 1])
                         c1.write(f"**{row['Datum']}** | {row['Location_Name']} ({row['Ensemble']})"); c1.caption(f"Datei: {row['Setlist_Name']}")
-                        if 'File_Link' in row and row['File_Link']: c2.link_button("👁️ Ansehen", row['File_Link'])
-                        else: c2.caption("Kein Link")
+                        # Kein View Link mehr, da lokal
+                        c2.caption("Lokal gespeichert")
                         st.divider()
