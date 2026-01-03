@@ -11,8 +11,7 @@ import openpyxl
 
 # --- KONFIGURATION ---
 DB_NAME = "GEMA_Datenbank"
-TEMPLATE_FOLDER_ID = None # Wird automatisch gesucht
-OUTPUT_FOLDER_ID = None   # Wird automatisch gesucht
+# ACHTUNG: Bitte sicherstellen, dass im Drive Ordner "Templates" die Datei "Setlist_Template.xlsx" liegt!
 
 st.set_page_config(page_title="GEMA Manager", page_icon="xj", layout="centered")
 
@@ -42,134 +41,139 @@ try:
     client, drive_service = get_gspread_client()
     sh = client.open(DB_NAME)
 except Exception as e:
-    st.error(f"Verbindungsfehler: {e}"); st.stop()
+    st.error(f"Verbindungsfehler zur Datenbank: {e}"); st.stop()
 
-# --- DRIVE HELPER ---
+# --- DRIVE HELPER (MIT DIAGNOSE) ---
 
 def get_folder_id(folder_name):
-    query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
-    items = results.get('files', [])
-    if items: return items[0]['id']
-    return None
+    """Sucht Ordner und gibt ID zurück. Zeigt Fehler im UI, wenn nicht gefunden."""
+    try:
+        query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+        items = results.get('files', [])
+        if items: 
+            return items[0]['id']
+        else:
+            # Fallback: Vielleicht ist er im Papierkorb oder nicht geteilt?
+            return None
+    except Exception as e:
+        st.error(f"Fehler bei Ordner-Suche '{folder_name}': {e}")
+        return None
 
 def download_template(filename):
-    """Lädt das Template aus dem Drive Ordner 'Templates' herunter"""
+    """Lädt das Template herunter"""
     folder_id = get_folder_id("Templates")
-    if not folder_id: return None
+    if not folder_id: 
+        return None, "Ordner 'Templates' nicht gefunden. Bitte erstellen und mit Bot teilen!"
     
     query = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
     results = drive_service.files().list(q=query, fields="files(id)").execute()
     items = results.get('files', [])
-    if not items: return None
+    if not items: 
+        return None, f"Datei '{filename}' nicht im Ordner 'Templates' gefunden."
     
-    file_id = items[0]['id']
-    content = drive_service.files().get_media(fileId=file_id).execute()
-    
-    with open(filename, "wb") as f:
-        f.write(content)
-    return filename
+    try:
+        file_id = items[0]['id']
+        content = drive_service.files().get_media(fileId=file_id).execute()
+        with open(filename, "wb") as f:
+            f.write(content)
+        return filename, None
+    except Exception as e:
+        return None, f"Fehler beim Download: {e}"
 
 def generate_and_upload_excel(datum, uhrzeit, ensemble, ort_data, songs_list, filename):
-    """
-    1. Lädt Template
-    2. Füllt Daten ein (OpenPyXL)
-    3. Lädt hoch in 'Output' Ordner
-    4. Gibt Web-Link zurück
-    """
     # 1. Template holen
-    template_name = "Setlist_Template.xlsx" # Muss exakt so im Drive/Templates liegen
-    if not download_template(template_name):
-        return None, "Template nicht gefunden!"
+    template_name = "Setlist_Template.xlsx" 
+    temp_file, err = download_template(template_name)
+    if err: return None, err
 
     # 2. Excel bearbeiten
     try:
-        wb = openpyxl.load_workbook(template_name)
-        ws = wb.active # Erstes Blatt
+        wb = openpyxl.load_workbook(temp_file)
+        ws = wb.active 
         
-        # --- HEADER DATEN SCHREIBEN ---
-        # Anpassung an deine Vorlage (Beispielkoordinaten - ggf. anpassen!)
-        # Annahme: Datum steht irgendwo oben, Ensemble auch.
-        # Hier trage ich es beispielhaft in Zelle B1 ein (als Notiz), da ich die exakten Header-Zellen deiner Vorlage nicht kenne.
-        # Du kannst das später verfeinern.
-        ws['B2'] = f"{ensemble} | {datum} | {ort_data.get('Stadt')}" 
+        # Header schreiben (Anpassung auf Zeile 1-13)
+        # Beispielhaft: Ensemble oben
+        ws['B1'] = ensemble 
+        ws['B2'] = datum 
+        ws['B3'] = ort_data.get('Stadt', '')
         
-        # --- SONGS SCHREIBEN ---
-        start_row = 14 # GEMA Listen fangen oft hier an
+        start_row = 14
         current_row = start_row
         
-        # Lösche alte Inhalte (falls Template nicht leer war)
+        # Zeilen leeren
         for row in ws.iter_rows(min_row=start_row, max_row=100):
             for cell in row: cell.value = None
 
         for song in songs_list:
-            # song ist ein Dict aus der DB
-            # Spaltenmapping basierend auf deiner Vorlage
-            # A=Nr, B=Titel, F=Komponist, K=Live, etc.
+            ws.cell(row=current_row, column=2, value=song['Titel']) # B
+            ws.cell(row=current_row, column=5, value=song['Dauer']) # E
             
-            ws.cell(row=current_row, column=2, value=song['Titel']) # B: Titel
-            ws.cell(row=current_row, column=5, value=song['Dauer']) # E: Dauer
-            
-            komponist_full = f"{song['Komponist_Nachname']}, {song['Komponist_Vorname']}"
-            ws.cell(row=current_row, column=6, value=komponist_full) # F: Komponist
+            k_name = f"{song['Komponist_Nachname']}, {song['Komponist_Vorname']}"
+            ws.cell(row=current_row, column=6, value=k_name) # F
             
             if song['Bearbeiter_Nachname']:
-                ws.cell(row=current_row, column=16, value=f"{song['Bearbeiter_Nachname']}, {song['Bearbeiter_Vorname']}") # P: Bearbeiter
+                b_name = f"{song['Bearbeiter_Nachname']}, {song['Bearbeiter_Vorname']}"
+                ws.cell(row=current_row, column=16, value=b_name) # P
             
-            ws.cell(row=current_row, column=10, value=song['Verlag']) # J: Verlag
-            ws.cell(row=current_row, column=11, value="Live") # K: Live/Tonträger
+            ws.cell(row=current_row, column=10, value=song['Verlag']) # J
+            ws.cell(row=current_row, column=11, value="Live") # K
             
             current_row += 1
             
         wb.save(filename)
         
     except Exception as e:
-        return None, f"Excel Fehler: {e}"
+        return None, f"Fehler beim Excel-Schreiben (OpenPyXL): {e}"
 
     # 3. Upload
-    output_folder_id = get_folder_id("Output")
-    if not output_folder_id:
-        # Ordner erstellen falls nicht da
-        file_metadata = {'name': 'Output', 'mimeType': 'application/vnd.google-apps.folder', 'parents': [get_folder_id("GEMA Bpol")]}
-        folder = drive_service.files().create(body=file_metadata, fields='id').execute()
-        output_folder_id = folder.get('id')
+    try:
+        output_folder_id = get_folder_id("Output")
+        if not output_folder_id:
+            # Versuch Ordner zu erstellen
+            # Wir brauchen die ID vom Parent Folder "GEMA Bpol", sonst landet es im Nirgendwo
+            parent_id = get_folder_id("GEMA Bpol")
+            if parent_id:
+                file_metadata = {'name': 'Output', 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}
+                folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+                output_folder_id = folder.get('id')
+            else:
+                return None, "Konnte 'Output' Ordner nicht finden und auch nicht erstellen (Hauptordner fehlt)."
 
-    file_metadata = {'name': filename, 'parents': [output_folder_id]}
-    media = MediaFileUpload(filename, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    
-    file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
-    
-    # Aufräumen (lokale Dateien löschen)
-    os.remove(template_name)
-    os.remove(filename)
-    
-    return file.get('webViewLink'), None
+        file_metadata = {'name': filename, 'parents': [output_folder_id]}
+        media = MediaFileUpload(filename, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        
+        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+        
+        # Aufräumen
+        if os.path.exists(template_name): os.remove(template_name)
+        if os.path.exists(filename): os.remove(filename)
+        
+        return file.get('webViewLink'), None
+    except Exception as e:
+        return None, f"Fehler beim Upload zu Drive: {e}"
 
 
 # --- DB FUNKTIONEN ---
 
 def check_and_fix_db():
     if st.session_state.db_checked: return
-    # Repertoire
     try: ws_rep = sh.worksheet("Repertoire")
     except: ws_rep = sh.add_worksheet(title="Repertoire", rows=100, cols=15)
     rep_headers = ['ID', 'Titel', 'Komponist_Nachname', 'Komponist_Vorname', 'Bearbeiter_Nachname', 'Bearbeiter_Vorname', 'Dauer', 'Verlag', 'Werkeart', 'ISWC']
     if not ws_rep.row_values(1): ws_rep.update('A1:J1', [rep_headers])
     
-    # Events - JETZT MIT "File_Link" SPALTE
     try: ws_ev = sh.worksheet("Events")
     except: ws_ev = sh.add_worksheet(title="Events", rows=100, cols=15)
     event_headers = ['Event_ID', 'Datum', 'Uhrzeit', 'Ensemble', 'Location_Name', 'Strasse', 'PLZ', 'Stadt', 'Setlist_Name', 'Songs_IDs', 'File_Link']
     curr = ws_ev.row_values(1)
     if not curr or 'File_Link' not in curr:
-        ws_ev.clear(); ws_ev.update('A1:K1', [event_headers]) # A bis K
+        ws_ev.clear(); ws_ev.update('A1:K1', [event_headers]) 
 
-    # Locations
     try: ws_loc = sh.worksheet("Locations")
     except: ws_loc = sh.add_worksheet(title="Locations", rows=50, cols=5)
     loc_headers = ['ID', 'Name', 'Strasse', 'PLZ', 'Stadt']
     if not ws_loc.row_values(1): ws_loc.update('A1:E1', [loc_headers])
-    
     st.session_state.db_checked = True
 
 @st.cache_data(ttl=600)
@@ -180,7 +184,6 @@ def get_data_repertoire():
     required = ['ID', 'Titel', 'Komponist_Nachname', 'Bearbeiter_Nachname', 'Verlag', 'Komponist_Vorname', 'Bearbeiter_Vorname', 'Dauer']
     for col in required:
         if col not in df.columns: df[col] = ""
-    
     if not df.empty:
         df['ID'] = df['ID'].apply(lambda x: str(int(float(str(x).replace(',','.')))) if str(x).replace(',','.',1).replace('.','',1).isdigit() else str(x))
         df['Label'] = df.apply(lambda row: f"{row['Titel']} ({row['Komponist_Nachname']})" + (f" / Arr: {row['Bearbeiter_Nachname']}" if row['Bearbeiter_Nachname'] else ""), axis=1)
@@ -252,7 +255,6 @@ def update_event_in_db(event_id, row_data):
     try:
         cell = ws.find(str(event_id), in_column=1)
         row_num = cell.row
-        # Update bis Spalte K (File_Link)
         ws.update(f"A{row_num}:K{row_num}", [[event_id] + row_data])
         clear_all_caches(); return True
     except: return False
@@ -378,7 +380,8 @@ if st.session_state.page == "speichern":
                     web_link, err = generate_and_upload_excel(datum_str, time_str, st.session_state.gig_draft['ensemble'], final_loc, selected_songs_data, dateiname)
                     
                     if err:
-                        st.error(err)
+                        st.error(f"⚠️ {err}")
+                        st.info("TIPP: Hast du 'requirements.txt' aktualisiert? Hast du den Ordner 'Templates' und die Datei 'Setlist_Template.xlsx' im Drive?")
                     else:
                         row_data = [
                             datum_str, time_str, st.session_state.gig_draft["ensemble"],
@@ -452,7 +455,6 @@ elif st.session_state.page == "archiv":
                         c1.write(f"**{row['Datum']}** | {row['Location_Name']} ({row['Ensemble']})")
                         c1.caption(f"Datei: {row['Setlist_Name']}")
                         
-                        # DER LINK BUTTON
                         if 'File_Link' in row and row['File_Link']:
                             c2.link_button("👁️ Ansehen", row['File_Link'])
                         else:
