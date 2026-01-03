@@ -3,34 +3,31 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 import datetime
 import time
+import os
+import openpyxl
 
 # --- KONFIGURATION ---
 DB_NAME = "GEMA_Datenbank"
+TEMPLATE_FOLDER_ID = None # Wird automatisch gesucht
+OUTPUT_FOLDER_ID = None   # Wird automatisch gesucht
 
-# --- SETUP & VERBINDUNG ---
 st.set_page_config(page_title="GEMA Manager", page_icon="xj", layout="centered")
 
+# --- SESSION STATE ---
 if 'gig_draft' not in st.session_state:
     st.session_state.gig_draft = {
-        "event_id": None,
-        "datum": datetime.date.today(),
-        "uhrzeit": datetime.time(19, 0),
-        "ensemble": "Tutti",
-        "location_selection": "Bitte wählen...", 
-        "new_loc_data": {},
-        "selected_songs": []
+        "event_id": None, "datum": datetime.date.today(), "uhrzeit": datetime.time(19, 0),
+        "ensemble": "Tutti", "location_selection": "Bitte wählen...", 
+        "new_loc_data": {}
     }
 
-if 'rep_edit_state' not in st.session_state:
-    st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
-
-if 'page' not in st.session_state:
-    st.session_state.page = "speichern"
-
-if 'db_checked' not in st.session_state:
-    st.session_state.db_checked = False
+if 'gig_song_selector' not in st.session_state: st.session_state.gig_song_selector = []
+if 'rep_edit_state' not in st.session_state: st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
+if 'page' not in st.session_state: st.session_state.page = "speichern"
+if 'db_checked' not in st.session_state: st.session_state.db_checked = False
 
 @st.cache_resource
 def get_gspread_client():
@@ -45,29 +42,129 @@ try:
     client, drive_service = get_gspread_client()
     sh = client.open(DB_NAME)
 except Exception as e:
-    st.error(f"Verbindungsfehler: {e}")
-    st.stop()
+    st.error(f"Verbindungsfehler: {e}"); st.stop()
 
-# --- DB FUNKTIONEN (CACHED) ---
+# --- DRIVE HELPER ---
+
+def get_folder_id(folder_name):
+    query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    results = drive_service.files().list(q=query, fields="files(id, name)").execute()
+    items = results.get('files', [])
+    if items: return items[0]['id']
+    return None
+
+def download_template(filename):
+    """Lädt das Template aus dem Drive Ordner 'Templates' herunter"""
+    folder_id = get_folder_id("Templates")
+    if not folder_id: return None
+    
+    query = f"name = '{filename}' and '{folder_id}' in parents and trashed = false"
+    results = drive_service.files().list(q=query, fields="files(id)").execute()
+    items = results.get('files', [])
+    if not items: return None
+    
+    file_id = items[0]['id']
+    content = drive_service.files().get_media(fileId=file_id).execute()
+    
+    with open(filename, "wb") as f:
+        f.write(content)
+    return filename
+
+def generate_and_upload_excel(datum, uhrzeit, ensemble, ort_data, songs_list, filename):
+    """
+    1. Lädt Template
+    2. Füllt Daten ein (OpenPyXL)
+    3. Lädt hoch in 'Output' Ordner
+    4. Gibt Web-Link zurück
+    """
+    # 1. Template holen
+    template_name = "Setlist_Template.xlsx" # Muss exakt so im Drive/Templates liegen
+    if not download_template(template_name):
+        return None, "Template nicht gefunden!"
+
+    # 2. Excel bearbeiten
+    try:
+        wb = openpyxl.load_workbook(template_name)
+        ws = wb.active # Erstes Blatt
+        
+        # --- HEADER DATEN SCHREIBEN ---
+        # Anpassung an deine Vorlage (Beispielkoordinaten - ggf. anpassen!)
+        # Annahme: Datum steht irgendwo oben, Ensemble auch.
+        # Hier trage ich es beispielhaft in Zelle B1 ein (als Notiz), da ich die exakten Header-Zellen deiner Vorlage nicht kenne.
+        # Du kannst das später verfeinern.
+        ws['B2'] = f"{ensemble} | {datum} | {ort_data.get('Stadt')}" 
+        
+        # --- SONGS SCHREIBEN ---
+        start_row = 14 # GEMA Listen fangen oft hier an
+        current_row = start_row
+        
+        # Lösche alte Inhalte (falls Template nicht leer war)
+        for row in ws.iter_rows(min_row=start_row, max_row=100):
+            for cell in row: cell.value = None
+
+        for song in songs_list:
+            # song ist ein Dict aus der DB
+            # Spaltenmapping basierend auf deiner Vorlage
+            # A=Nr, B=Titel, F=Komponist, K=Live, etc.
+            
+            ws.cell(row=current_row, column=2, value=song['Titel']) # B: Titel
+            ws.cell(row=current_row, column=5, value=song['Dauer']) # E: Dauer
+            
+            komponist_full = f"{song['Komponist_Nachname']}, {song['Komponist_Vorname']}"
+            ws.cell(row=current_row, column=6, value=komponist_full) # F: Komponist
+            
+            if song['Bearbeiter_Nachname']:
+                ws.cell(row=current_row, column=16, value=f"{song['Bearbeiter_Nachname']}, {song['Bearbeiter_Vorname']}") # P: Bearbeiter
+            
+            ws.cell(row=current_row, column=10, value=song['Verlag']) # J: Verlag
+            ws.cell(row=current_row, column=11, value="Live") # K: Live/Tonträger
+            
+            current_row += 1
+            
+        wb.save(filename)
+        
+    except Exception as e:
+        return None, f"Excel Fehler: {e}"
+
+    # 3. Upload
+    output_folder_id = get_folder_id("Output")
+    if not output_folder_id:
+        # Ordner erstellen falls nicht da
+        file_metadata = {'name': 'Output', 'mimeType': 'application/vnd.google-apps.folder', 'parents': [get_folder_id("GEMA Bpol")]}
+        folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+        output_folder_id = folder.get('id')
+
+    file_metadata = {'name': filename, 'parents': [output_folder_id]}
+    media = MediaFileUpload(filename, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    
+    file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+    
+    # Aufräumen (lokale Dateien löschen)
+    os.remove(template_name)
+    os.remove(filename)
+    
+    return file.get('webViewLink'), None
+
+
+# --- DB FUNKTIONEN ---
 
 def check_and_fix_db():
     if st.session_state.db_checked: return
-
+    # Repertoire
     try: ws_rep = sh.worksheet("Repertoire")
     except: ws_rep = sh.add_worksheet(title="Repertoire", rows=100, cols=15)
-    rep_headers = ['ID', 'Titel', 'Komponist_Nachname', 'Komponist_Vorname', 
-                   'Bearbeiter_Nachname', 'Bearbeiter_Vorname', 'Dauer', 'Verlag', 'Werkeart', 'ISWC']
-    curr_rep = ws_rep.row_values(1)
-    if not curr_rep or curr_rep[0] != 'ID': ws_rep.update('A1:J1', [rep_headers])
-
+    rep_headers = ['ID', 'Titel', 'Komponist_Nachname', 'Komponist_Vorname', 'Bearbeiter_Nachname', 'Bearbeiter_Vorname', 'Dauer', 'Verlag', 'Werkeart', 'ISWC']
+    if not ws_rep.row_values(1): ws_rep.update('A1:J1', [rep_headers])
+    
+    # Events - JETZT MIT "File_Link" SPALTE
     try: ws_ev = sh.worksheet("Events")
     except: ws_ev = sh.add_worksheet(title="Events", rows=100, cols=15)
-    event_headers = ['Event_ID', 'Datum', 'Uhrzeit', 'Ensemble', 'Location_Name', 
-                     'Strasse', 'PLZ', 'Stadt', 'Setlist_Name', 'Songs_IDs']
-    curr_ev = ws_ev.row_values(1)
-    if not curr_ev or 'Uhrzeit' not in curr_ev:
-        ws_ev.clear(); ws_ev.update('A1:J1', [event_headers])
+    event_headers = ['Event_ID', 'Datum', 'Uhrzeit', 'Ensemble', 'Location_Name', 'Strasse', 'PLZ', 'Stadt', 'Setlist_Name', 'Songs_IDs', 'File_Link']
+    curr = ws_ev.row_values(1)
+    if not curr or 'File_Link' not in curr:
+        ws_ev.clear(); ws_ev.update('A1:K1', [event_headers]) # A bis K
 
+    # Locations
     try: ws_loc = sh.worksheet("Locations")
     except: ws_loc = sh.add_worksheet(title="Locations", rows=50, cols=5)
     loc_headers = ['ID', 'Name', 'Strasse', 'PLZ', 'Stadt']
@@ -80,28 +177,13 @@ def get_data_repertoire():
     ws = sh.worksheet("Repertoire")
     data = ws.get_all_records()
     df = pd.DataFrame(data)
-    required = ['ID', 'Titel', 'Komponist_Nachname', 'Bearbeiter_Nachname']
+    required = ['ID', 'Titel', 'Komponist_Nachname', 'Bearbeiter_Nachname', 'Verlag', 'Komponist_Vorname', 'Bearbeiter_Vorname', 'Dauer']
     for col in required:
         if col not in df.columns: df[col] = ""
     
-    # 1. ID BEREINIGUNG (Wichtig!)
     if not df.empty:
-        # Versucht alles in eine saubere String-Zahl ohne .0 zu wandeln
-        def clean_id_cell(x):
-            try: return str(int(float(str(x).replace(',','.'))))
-            except: return str(x)
-        df['ID'] = df['ID'].apply(clean_id_cell)
-
-        # 2. LABEL ZENTRAL ERSTELLEN
-        # Damit wir überall exakt denselben String haben
-        def make_label(row):
-            base = f"{row['Titel']} ({row['Komponist_Nachname']})"
-            if row['Bearbeiter_Nachname']:
-                base += f" / Arr: {row['Bearbeiter_Nachname']}"
-            return base
-        
-        df['Label'] = df.apply(make_label, axis=1)
-    
+        df['ID'] = df['ID'].apply(lambda x: str(int(float(str(x).replace(',','.')))) if str(x).replace(',','.',1).replace('.','',1).isdigit() else str(x))
+        df['Label'] = df.apply(lambda row: f"{row['Titel']} ({row['Komponist_Nachname']})" + (f" / Arr: {row['Bearbeiter_Nachname']}" if row['Bearbeiter_Nachname'] else ""), axis=1)
     return df
 
 @st.cache_data(ttl=600)
@@ -122,35 +204,22 @@ def get_data_events():
     return df
 
 def clear_all_caches():
-    get_data_repertoire.clear()
-    get_data_locations.clear()
-    get_data_events.clear()
+    get_data_repertoire.clear(); get_data_locations.clear(); get_data_events.clear()
 
-# --- HELPER: ID CLEANER ---
 def clean_id_list_from_string(raw_input):
-    """Macht aus '1, 2.0, 3' eine saubere Liste ['1', '2', '3']"""
     if not raw_input: return []
-    str_val = str(raw_input)
-    parts = str_val.split(',')
-    clean_ids = []
+    parts = str(raw_input).split(',')
+    clean = []
     for p in parts:
         s = p.strip()
         if not s: continue
-        try:
-            val = int(float(s))
-            clean_ids.append(str(val))
-        except:
-            clean_ids.append(s)
-    return clean_ids
+        try: clean.append(str(int(float(s))))
+        except: clean.append(s)
+    return clean
 
 def reset_draft():
-    st.session_state.gig_draft = {
-        "event_id": None, "datum": datetime.date.today(), "uhrzeit": datetime.time(19, 0),
-        "ensemble": "Tutti", "location_selection": "Bitte wählen...", 
-        "new_loc_data": {}, "selected_songs": []
-    }
-
-# --- SPEICHER FUNKTIONEN ---
+    st.session_state.gig_draft = {"event_id": None, "datum": datetime.date.today(), "uhrzeit": datetime.time(19, 0), "ensemble": "Tutti", "location_selection": "Bitte wählen...", "new_loc_data": {}}
+    st.session_state.gig_song_selector = []
 
 def save_song_direct(mode, song_id, titel, kn, kv, bn, bv, dauer, verlag):
     ws = sh.worksheet("Repertoire")
@@ -161,16 +230,14 @@ def save_song_direct(mode, song_id, titel, kn, kv, bn, bv, dauer, verlag):
         row = [new_id, titel, kn, kv, bn, bv, dauer, verlag, "U-Musik", ""]
         ws.append_row(row)
         msg = f"'{titel}' angelegt!"
-    else: # Edit
+    else: 
         try:
             cell = ws.find(str(song_id), in_column=1)
             r = cell.row
             ws.update(f"B{r}:H{r}", [[titel, kn, kv, bn, bv, dauer, verlag]])
             msg = f"'{titel}' aktualisiert!"
         except: return False, "Fehler beim Update"
-    
-    clear_all_caches()
-    return True, msg
+    clear_all_caches(); return True, msg
 
 def save_location_direct(name, strasse, plz, stadt):
     ws = sh.worksheet("Locations")
@@ -178,276 +245,216 @@ def save_location_direct(name, strasse, plz, stadt):
     ids = [int(x) for x in col_ids if str(x).isdigit()]
     new_id = max(ids) + 1 if ids else 1
     ws.append_row([new_id, name, strasse, plz, stadt])
-    clear_all_caches()
-    return True
+    clear_all_caches(); return True
 
 def update_event_in_db(event_id, row_data):
     ws = sh.worksheet("Events")
     try:
         cell = ws.find(str(event_id), in_column=1)
         row_num = cell.row
-        ws.update(f"A{row_num}:J{row_num}", [[event_id] + row_data])
-        clear_all_caches()
-        return True
-    except Exception as e:
-        return False
+        # Update bis Spalte K (File_Link)
+        ws.update(f"A{row_num}:K{row_num}", [[event_id] + row_data])
+        clear_all_caches(); return True
+    except: return False
 
 # --- NAVIGATION ---
-
 def navigation_bar():
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
-    if c1.button("💾 Speichern / Edit", use_container_width=True, type="primary" if st.session_state.page == "speichern" else "secondary"):
-        st.session_state.page = "speichern"; st.rerun()
-    if c2.button("🎵 Repertoire", use_container_width=True, type="primary" if st.session_state.page == "repertoire" else "secondary"):
-        st.session_state.page = "repertoire"; st.rerun()
-    if c3.button("📍 Orte", use_container_width=True, type="primary" if st.session_state.page == "orte" else "secondary"):
-        st.session_state.page = "orte"; st.rerun()
-    if c4.button("📂 Archiv", use_container_width=True, type="primary" if st.session_state.page == "archiv" else "secondary"):
-        st.session_state.page = "archiv"; st.rerun()
+    if c1.button("💾 Speichern / Edit", use_container_width=True, type="primary" if st.session_state.page == "speichern" else "secondary"): st.session_state.page = "speichern"; st.rerun()
+    if c2.button("🎵 Repertoire", use_container_width=True, type="primary" if st.session_state.page == "repertoire" else "secondary"): st.session_state.page = "repertoire"; st.rerun()
+    if c3.button("📍 Orte", use_container_width=True, type="primary" if st.session_state.page == "orte" else "secondary"): st.session_state.page = "orte"; st.rerun()
+    if c4.button("📂 Archiv", use_container_width=True, type="primary" if st.session_state.page == "archiv" else "secondary"): st.session_state.page = "archiv"; st.rerun()
     st.markdown("---")
 
-# --- HAUPTPROGRAMM ---
-
+# --- MAIN ---
 check_and_fix_db()
 st.title("Orchester Manager 🎻")
 navigation_bar()
 
-# ==========================================
-# SEITE 1: AUFTRITT SPEICHERN
-# ==========================================
+# === SEITE 1: SPEICHERN ===
 if st.session_state.page == "speichern":
-    
     df_loc = get_data_locations()
-    df_rep = get_data_repertoire() # Hier wird jetzt das Label zentral erstellt!
+    df_rep = get_data_repertoire()
     df_events = get_data_events()
     
-    # --- EDITIER-FUNKTION ---
+    # Editier-Auswahl
     if st.session_state.gig_draft["event_id"] is None:
         with st.expander("🛠 Bereits gespeicherten Auftritt bearbeiten", expanded=False):
             if not df_events.empty:
                 df_events['Label'] = df_events.apply(lambda x: f"{x['Datum']} - {x['Location_Name']} ({x['Ensemble']})", axis=1)
                 df_events = df_events.sort_values(by='Datum_Obj', ascending=False)
                 
-                edit_options = ["Bitte wählen..."] + df_events['Label'].tolist()
-                edit_selection = st.selectbox("Wähle einen Auftritt:", edit_options)
-                
-                if st.button("Laden"):
-                    if edit_selection != "Bitte wählen...":
-                        row = df_events[df_events['Label'] == edit_selection].iloc[0]
-                        st.session_state.gig_draft["event_id"] = row['Event_ID']
-                        st.session_state.gig_draft["datum"] = datetime.datetime.strptime(row['Datum'], "%d.%m.%Y").date()
-                        try: st.session_state.gig_draft["uhrzeit"] = datetime.datetime.strptime(row['Uhrzeit'], "%H:%M").time()
-                        except: st.session_state.gig_draft["uhrzeit"] = datetime.time(19, 0)
-                        st.session_state.gig_draft["ensemble"] = row['Ensemble']
-                        st.session_state.gig_draft["location_selection"] = row['Location_Name']
-                        
-                        # ID LOGIK:
-                        saved_ids = clean_id_list_from_string(row['Songs_IDs'])
-                        
-                        restored_labels = []
-                        if not df_rep.empty and 'Label' in df_rep.columns:
-                            # Wir filtern direkt im DataFrame nach den IDs
-                            # Das ist sicherer als ein Dictionary Lookup
-                            selected_rows = df_rep[df_rep['ID'].isin(saved_ids)]
-                            restored_labels = selected_rows['Label'].tolist()
-                        
-                        st.session_state.gig_draft["selected_songs"] = restored_labels
-                        st.toast("Geladen!", icon="✏️"); time.sleep(0.5); st.rerun()
-            else:
-                st.info("Keine gespeicherten Auftritte.")
+                edit_sel = st.selectbox("Wähle einen Auftritt:", ["Bitte wählen..."] + df_events['Label'].tolist())
+                if st.button("Laden") and edit_sel != "Bitte wählen...":
+                    row = df_events[df_events['Label'] == edit_sel].iloc[0]
+                    st.session_state.gig_draft["event_id"] = row['Event_ID']
+                    st.session_state.gig_draft["datum"] = datetime.datetime.strptime(row['Datum'], "%d.%m.%Y").date()
+                    try: st.session_state.gig_draft["uhrzeit"] = datetime.datetime.strptime(row['Uhrzeit'], "%H:%M").time()
+                    except: st.session_state.gig_draft["uhrzeit"] = datetime.time(19, 0)
+                    st.session_state.gig_draft["ensemble"] = row['Ensemble']
+                    st.session_state.gig_draft["location_selection"] = row['Location_Name']
+                    
+                    saved_ids = clean_id_list_from_string(row['Songs_IDs'])
+                    restored_labels = []
+                    if not df_rep.empty:
+                        rows = df_rep[df_rep['ID'].isin(saved_ids)]
+                        restored_labels = rows['Label'].tolist()
+                    
+                    st.session_state.gig_song_selector = restored_labels
+                    st.toast("Geladen!", icon="✏️"); time.sleep(0.5); st.rerun()
 
-    # --- HEADER & ZURÜCK ---
     if st.session_state.gig_draft["event_id"]:
-        col_back, col_head = st.columns([1, 3])
-        if col_back.button("⬅️ Zurück / Neu"):
-            reset_draft(); st.rerun()
-        col_head.header(f"✏️ Bearbeiten (ID: {st.session_state.gig_draft['event_id']})")
-    else:
-        st.header("📝 Neuen Auftritt erfassen")
+        cb, ch = st.columns([1,3])
+        if cb.button("⬅️ Zurück"): reset_draft(); st.rerun()
+        ch.header(f"✏️ Bearbeiten (ID: {st.session_state.gig_draft['event_id']})")
+    else: st.header("📝 Neuen Auftritt erfassen")
 
-    # --- RAHMENDATEN ---
     c_date, c_time = st.columns(2)
     st.session_state.gig_draft["datum"] = c_date.date_input("Datum", value=st.session_state.gig_draft["datum"])
     st.session_state.gig_draft["uhrzeit"] = c_time.time_input("Uhrzeit", value=st.session_state.gig_draft["uhrzeit"])
     
-    st.session_state.gig_draft["ensemble"] = st.selectbox("Ensemble", ["Tutti", "BQ", "Quartett", "Duo"], 
-                                                          index=["Tutti", "BQ", "Quartett", "Duo"].index(st.session_state.gig_draft["ensemble"]))
+    ens_opts = ["Tutti", "BQ", "Quartett", "Duo"]
+    st.session_state.gig_draft["ensemble"] = st.selectbox("Ensemble", ens_opts, index=ens_opts.index(st.session_state.gig_draft["ensemble"]))
 
-    # --- LOCATION ---
     st.write("📍 **Spielort**")
-    loc_options = ["Bitte wählen..."] + df_loc['Name'].tolist() + ["➕ Neuer Ort..."]
-    try: sel_idx = loc_options.index(st.session_state.gig_draft["location_selection"])
+    loc_opts = ["Bitte wählen..."] + df_loc['Name'].tolist() + ["➕ Neuer Ort..."]
+    try: sel_idx = loc_opts.index(st.session_state.gig_draft["location_selection"])
     except: sel_idx = 0
-    selected_loc = st.selectbox("Ort:", options=loc_options, index=sel_idx)
-    st.session_state.gig_draft["location_selection"] = selected_loc
+    sel_loc = st.selectbox("Ort:", options=loc_opts, index=sel_idx)
+    st.session_state.gig_draft["location_selection"] = sel_loc
 
-    final_loc_data = {}
-    if selected_loc == "➕ Neuer Ort...":
-        st.info("Neue Adresse eingeben:")
+    final_loc = {}
+    if sel_loc == "➕ Neuer Ort...":
         with st.form("new_loc_form"):
-            nl_name = st.text_input("Name*"); nl_str = st.text_input("Straße & Nr")
-            c_plz, c_stadt = st.columns([1, 2])
-            nl_plz = c_plz.text_input("PLZ"); nl_stadt = c_stadt.text_input("Stadt*")
+            n = st.text_input("Name*"); s = st.text_input("Str."); p = st.text_input("PLZ"); ci = st.text_input("Stadt*")
             if st.form_submit_button("Bestätigen"):
-                st.session_state.gig_draft["new_loc_data"] = {"Name": nl_name, "Strasse": nl_str, "PLZ": nl_plz, "Stadt": nl_stadt}
-                st.success("Übernommen!"); st.rerun()
-        
-        if st.session_state.gig_draft["new_loc_data"]:
-            d = st.session_state.gig_draft["new_loc_data"]
-            st.caption(f"✅ Vorgemerkt: {d.get('Name')}")
-            final_loc_data = d
-    elif selected_loc != "Bitte wählen...":
-        row = df_loc[df_loc['Name'] == selected_loc].iloc[0]
-        final_loc_data = row.to_dict()
-        st.caption(f"Adresse: {final_loc_data['Strasse']}, {final_loc_data['Stadt']}")
+                st.session_state.gig_draft["new_loc_data"] = {"Name": n, "Strasse": s, "PLZ": p, "Stadt": ci}
+                st.rerun()
+        if st.session_state.gig_draft["new_loc_data"]: final_loc = st.session_state.gig_draft["new_loc_data"]
+    elif sel_loc != "Bitte wählen...":
+        final_loc = df_loc[df_loc['Name'] == sel_loc].iloc[0].to_dict()
 
     st.markdown("---")
-
-    # --- SONGS ---
     st.write("🎵 **Programm**")
     with st.expander("➕ Titel fehlt? Hier sofort anlegen"):
-        with st.form("quick_add_song"):
-            qc1, qc2 = st.columns([3, 1])
-            q_tit = qc1.text_input("Titel"); q_dur = qc2.text_input("Dauer", value="03:00")
-            qc3, qc4 = st.columns(2)
-            q_kn = qc3.text_input("Komponist NN"); q_kv = qc4.text_input("Komponist VN")
-            qc5, qc6 = st.columns(2)
-            q_bn = qc5.text_input("Bearbeiter NN"); q_bv = qc6.text_input("Bearbeiter VN")
-            q_ver = st.text_input("Verlag")
-            if st.form_submit_button("Schnell speichern"):
-                if q_tit and q_kn:
-                    save_song_direct("Neu", None, q_tit, q_kn, q_kv, q_bn, q_bv, q_dur, q_ver)
-                    st.toast(f"'{q_tit}' hinzugefügt!", icon="✅"); time.sleep(1); st.rerun()
-                else: st.error("Pflichtfelder fehlen.")
+        with st.form("quick_add"):
+            c1, c2 = st.columns([3,1]); t=c1.text_input("Titel"); d=c2.text_input("Dauer", "03:00")
+            c3, c4 = st.columns(2); kn=c3.text_input("Komp NN"); kv=c4.text_input("Komp VN")
+            c5, c6 = st.columns(2); bn=c5.text_input("Bearb NN"); bv=c6.text_input("Bearb VN")
+            ver = st.text_input("Verlag")
+            if st.form_submit_button("Speichern"):
+                if t and kn:
+                    save_song_direct("Neu", None, t, kn, kv, bn, bv, d, ver)
+                    st.rerun()
 
-    if not df_rep.empty and 'Label' in df_rep.columns:
-        # Hier nutzen wir exakt dieselbe Spalte 'Label', die oben generiert wurde
-        all_options = df_rep['Label'].tolist()
-        
-        # Validierung: Nur Songs, die auch wirklich in 'all_options' existieren
-        valid_selected = [s for s in st.session_state.gig_draft["selected_songs"] if s in all_options]
-        
-        selection = st.multiselect("Suche:", options=all_options, default=valid_selected)
-        st.session_state.gig_draft["selected_songs"] = selection
+    if not df_rep.empty:
+        selection = st.multiselect("Suche:", options=df_rep['Label'].tolist(), key="gig_song_selector")
         
         st.markdown("---")
-        
-        btn_text = "🔄 Änderungen speichern" if st.session_state.gig_draft["event_id"] else "✅ Final speichern"
-        if st.button(btn_text, type="primary", use_container_width=True):
-            errors = []
-            if selected_loc == "Bitte wählen..." or (selected_loc == "➕ Neuer Ort..." and not final_loc_data.get("Name")):
-                errors.append("Bitte Ort wählen.")
-            if not selection: errors.append("Kein Stück gewählt.")
-            
-            if errors:
-                for e in errors: st.error(e)
+        btn_txt = "🔄 Aktualisieren" if st.session_state.gig_draft["event_id"] else "✅ Final speichern & Excel erstellen"
+        if st.button(btn_txt, type="primary", use_container_width=True):
+            if not final_loc.get("Name") or not selection:
+                st.error("Ort und Programm fehlen!")
             else:
-                if selected_loc == "➕ Neuer Ort...":
-                    save_location_direct(final_loc_data["Name"], final_loc_data["Strasse"], final_loc_data["PLZ"], final_loc_data["Stadt"])
+                if sel_loc == "➕ Neuer Ort...":
+                    save_location_direct(final_loc["Name"], final_loc["Strasse"], final_loc["PLZ"], final_loc["Stadt"])
                 
+                # Excel Generierung vorbereiten
                 datum_str = st.session_state.gig_draft["datum"].strftime("%d.%m.%Y")
                 time_str = st.session_state.gig_draft["uhrzeit"].strftime("%H:%M")
-                dateiname = f"{st.session_state.gig_draft['ensemble']}{datum_str}{final_loc_data['Stadt']}Setlist.xlsx"
+                dateiname = f"{st.session_state.gig_draft['ensemble']}{datum_str}{final_loc['Stadt']}Setlist.xlsx"
                 
-                # IDs holen (wieder über das Label matchen)
+                # Songs Objekte holen für Excel
+                selected_songs_data = []
                 song_ids = []
                 for label in selection:
                     row = df_rep[df_rep['Label'] == label].iloc[0]
                     song_ids.append(str(row['ID']))
+                    selected_songs_data.append(row.to_dict())
                 
-                row_data = [
-                    datum_str, time_str, st.session_state.gig_draft["ensemble"],
-                    final_loc_data["Name"], final_loc_data["Strasse"], str(final_loc_data["PLZ"]), final_loc_data["Stadt"],
-                    dateiname, ",".join(song_ids)
-                ]
-                
-                if st.session_state.gig_draft["event_id"]:
-                    success = update_event_in_db(st.session_state.gig_draft["event_id"], row_data)
-                    msg = "Aktualisiert!"
-                else:
-                    ws_ev = sh.worksheet("Events"); col_ids = ws_ev.col_values(1)[1:]
-                    e_ids = [int(x) for x in col_ids if str(x).isdigit()]
-                    new_ev_id = max(e_ids) + 1 if e_ids else 1
-                    ws_ev.append_row([new_ev_id] + row_data)
-                    clear_all_caches()
-                    success = True
-                    msg = "Gespeichert!"
-                
-                if success:
-                    st.balloons(); st.success(f"{msg} Setlist: {dateiname}")
-                    reset_draft(); time.sleep(2); st.rerun()
+                with st.spinner("Erstelle Excel-Datei und lade hoch..."):
+                    # EXCEL GENERIERUNG
+                    web_link, err = generate_and_upload_excel(datum_str, time_str, st.session_state.gig_draft['ensemble'], final_loc, selected_songs_data, dateiname)
+                    
+                    if err:
+                        st.error(err)
+                    else:
+                        row_data = [
+                            datum_str, time_str, st.session_state.gig_draft["ensemble"],
+                            final_loc["Name"], final_loc["Strasse"], str(final_loc["PLZ"]), final_loc["Stadt"],
+                            dateiname, ",".join(song_ids), web_link
+                        ]
+                        
+                        if st.session_state.gig_draft["event_id"]:
+                            update_event_in_db(st.session_state.gig_draft["event_id"], row_data)
+                        else:
+                            ws_ev = sh.worksheet("Events"); col_ids = ws_ev.col_values(1)[1:]
+                            e_ids = [int(x) for x in col_ids if str(x).isdigit()]
+                            new_ev_id = max(e_ids) + 1 if e_ids else 1
+                            ws_ev.append_row([new_ev_id] + row_data)
+                            clear_all_caches()
+                        
+                        st.balloons()
+                        st.success(f"Fertig! Datei erstellt: {dateiname}")
+                        reset_draft(); time.sleep(3); st.rerun()
     else: st.warning("Repertoire leer.")
 
-# ==========================================
-# SEITE 2: REPERTOIRE (SUCHE & EDIT)
-# ==========================================
+# === SEITE 2: REPERTOIRE ===
 elif st.session_state.page == "repertoire":
     st.subheader("Repertoire verwalten")
-    
-    rep_mode = st.radio("Modus:", ["Neu anlegen", "Bearbeiten"], horizontal=True)
+    mode = st.radio("Modus:", ["Neu", "Bearbeiten"], horizontal=True)
     df_rep = get_data_repertoire()
-
-    # --- DATEN VORBEREITEN ---
-    if rep_mode == "Bearbeiten":
-        if not df_rep.empty and 'Label' in df_rep.columns:
-            search_rep = st.selectbox("Stück suchen & laden:", df_rep['Label'].tolist(), index=None, placeholder="Tippen zum Suchen...")
-            
-            if search_rep:
-                row = df_rep[df_rep['Label'] == search_rep].iloc[0]
-                if st.session_state.rep_edit_state["id"] != row['ID']:
-                    st.session_state.rep_edit_state = {
-                        "id": row['ID'], "titel": row['Titel'], "dauer": str(row['Dauer']),
-                        "kn": row['Komponist_Nachname'], "kv": row['Komponist_Vorname'],
-                        "bn": row['Bearbeiter_Nachname'], "bv": row['Bearbeiter_Vorname'],
-                        "verlag": row['Verlag']
-                    }
-        else:
-            st.warning("Liste leer.")
-
-    elif rep_mode == "Neu anlegen":
-        if st.session_state.rep_edit_state["id"] is not None:
-             st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "03:00", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
-
-    # --- FORMULAR ---
-    with st.form("rep_form"):
-        s = st.session_state.rep_edit_state
-        c1, c2 = st.columns([3,1])
-        t = c1.text_input("Titel", value=s["titel"])
-        d = c2.text_input("Dauer", value=s["dauer"])
-        c3, c4 = st.columns(2)
-        kn = c3.text_input("Komponist NN", value=s["kn"])
-        kv = c4.text_input("Komponist VN", value=s["kv"])
-        c5, c6 = st.columns(2)
-        bn = c5.text_input("Bearbeiter NN", value=s["bn"])
-        bv = c6.text_input("Bearbeiter VN", value=s["bv"])
-        ver = st.text_input("Verlag", value=s["verlag"])
-        
-        if st.form_submit_button("Speichern"):
-            mode_arg = "Edit" if s["id"] else "Neu"
-            success, msg = save_song_direct(mode_arg, s["id"], t, kn, kv, bn, bv, d, ver)
-            if success:
-                st.success(msg)
-                st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
-                time.sleep(1); st.rerun()
-            else:
-                st.error("Fehler.")
     
-    st.divider()
+    if mode == "Bearbeiten" and not df_rep.empty:
+        sel = st.selectbox("Suchen:", df_rep['Label'].tolist(), index=None)
+        if sel:
+            r = df_rep[df_rep['Label'] == sel].iloc[0]
+            if st.session_state.rep_edit_state["id"] != r['ID']:
+                st.session_state.rep_edit_state = {"id": r['ID'], "titel": r['Titel'], "dauer": str(r['Dauer']), "kn": r['Komponist_Nachname'], "kv": r['Komponist_Vorname'], "bn": r['Bearbeiter_Nachname'], "bv": r['Bearbeiter_Vorname'], "verlag": r['Verlag']}
+    elif mode == "Neu" and st.session_state.rep_edit_state["id"]:
+        st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "03:00", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
+
+    with st.form("rep"):
+        s = st.session_state.rep_edit_state
+        c1,c2=st.columns([3,1]); t=c1.text_input("Titel", s["titel"]); d=c2.text_input("Dauer", s["dauer"])
+        c3,c4=st.columns(2); kn=c3.text_input("Komp NN", s["kn"]); kv=c4.text_input("Komp VN", s["kv"])
+        c5,c6=st.columns(2); bn=c5.text_input("Bearb NN", s["bn"]); bv=c6.text_input("Bearb VN", s["bv"])
+        v=st.text_input("Verlag", s["verlag"])
+        if st.form_submit_button("Speichern"):
+            save_song_direct("Edit" if s["id"] else "Neu", s["id"], t, kn, kv, bn, bv, d, v)
+            st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
+            st.rerun()
     st.dataframe(df_rep, use_container_width=True)
 
-# ==========================================
-# REST
-# ==========================================
+# === SEITE 3: ORTE ===
 elif st.session_state.page == "orte":
-    st.subheader("Locations")
-    with st.form("new_loc"):
-        l_name = st.text_input("Name"); l_stadt = st.text_input("Stadt")
-        if st.form_submit_button("Speichern"):
-            save_location_direct(l_name, "", "", l_stadt)
-            st.success("OK"); time.sleep(1); st.rerun()
-    st.dataframe(get_data_locations(), use_container_width=True)
+    st.subheader("Locations"); df_loc = get_data_locations()
+    with st.form("loc"):
+        n=st.text_input("Name"); ci=st.text_input("Stadt")
+        if st.form_submit_button("Speichern"): save_location_direct(n, "", "", ci); st.rerun()
+    st.dataframe(df_loc, use_container_width=True)
 
+# === SEITE 4: ARCHIV ===
 elif st.session_state.page == "archiv":
-    st.subheader("Archiv")
-    st.dataframe(get_data_events(), use_container_width=True)
+    st.subheader("📂 Setlist Archiv")
+    df_events = get_data_events()
+    if not df_events.empty:
+        df_events = df_events.sort_values(by='Datum_Obj', ascending=False)
+        for year in df_events['Datum_Obj'].dt.year.unique():
+            st.markdown(f"### {year}")
+            df_y = df_events[df_events['Datum_Obj'].dt.year == year]
+            for m in df_y['Datum_Obj'].dt.month.unique():
+                m_name = datetime.date(2000, int(m), 1).strftime('%B')
+                with st.expander(f"{m_name} ({len(df_y[df_y['Datum_Obj'].dt.month == m])})"):
+                    for _, row in df_y[df_y['Datum_Obj'].dt.month == m].iterrows():
+                        c1, c2 = st.columns([3, 1])
+                        c1.write(f"**{row['Datum']}** | {row['Location_Name']} ({row['Ensemble']})")
+                        c1.caption(f"Datei: {row['Setlist_Name']}")
+                        
+                        # DER LINK BUTTON
+                        if 'File_Link' in row and row['File_Link']:
+                            c2.link_button("👁️ Ansehen", row['File_Link'])
+                        else:
+                            c2.caption("Kein Link")
+                        st.divider()
