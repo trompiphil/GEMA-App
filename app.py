@@ -105,6 +105,35 @@ def clear_all_caches():
     get_data_locations.clear()
     get_data_events.clear()
 
+# --- HELPER: ID CLEANER (DIE WASCHMASCHINE) ---
+def clean_id_list(raw_input):
+    """Macht aus '1, 2.0, 3' eine saubere Liste ['1', '2', '3']"""
+    if not raw_input: return []
+    str_val = str(raw_input)
+    parts = str_val.split(',')
+    clean_ids = []
+    for p in parts:
+        s = p.strip()
+        if not s: continue
+        try:
+            val = int(float(s))
+            clean_ids.append(str(val))
+        except:
+            clean_ids.append(s)
+    return clean_ids
+
+def reset_draft():
+    """Setzt das Formular auf 'Neu' zurück"""
+    st.session_state.gig_draft = {
+        "event_id": None,
+        "datum": datetime.date.today(),
+        "uhrzeit": datetime.time(19, 0),
+        "ensemble": "Tutti",
+        "location_selection": "Bitte wählen...", 
+        "new_loc_data": {},
+        "selected_songs": []
+    }
+
 # --- SPEICHER FUNKTIONEN ---
 
 def save_song_direct(titel, kn, kv, bn, bv, dauer, verlag):
@@ -170,54 +199,51 @@ if st.session_state.page == "speichern":
     df_rep = get_data_repertoire()
     df_events = get_data_events()
     
-    # --- EDITIER-FUNKTION ---
-    with st.expander("🛠 Bereits gespeicherten Auftritt bearbeiten", expanded=False):
-        if not df_events.empty:
-            df_events['Label'] = df_events.apply(lambda x: f"{x['Datum']} - {x['Location_Name']} ({x['Ensemble']})", axis=1)
-            df_events = df_events.sort_values(by='Datum_Obj', ascending=False)
-            
-            edit_options = ["Neuen Auftritt erfassen"] + df_events['Label'].tolist()
-            edit_selection = st.selectbox("Wähle einen Auftritt:", edit_options)
-            
-            if st.button("Laden"):
-                if edit_selection != "Neuen Auftritt erfassen":
-                    row = df_events[df_events['Label'] == edit_selection].iloc[0]
-                    st.session_state.gig_draft["event_id"] = row['Event_ID']
-                    st.session_state.gig_draft["datum"] = datetime.datetime.strptime(row['Datum'], "%d.%m.%Y").date()
-                    try: st.session_state.gig_draft["uhrzeit"] = datetime.datetime.strptime(row['Uhrzeit'], "%H:%M").time()
-                    except: st.session_state.gig_draft["uhrzeit"] = datetime.time(19, 0)
-                    st.session_state.gig_draft["ensemble"] = row['Ensemble']
-                    st.session_state.gig_draft["location_selection"] = row['Location_Name']
-                    
-                    # --- HIER WAR DER FEHLER: JETZT KORRIGIERT ---
-                    # Wir splitten am Komma UND entfernen Leerzeichen mit .strip()
-                    saved_ids_str = str(row['Songs_IDs'])
-                    if saved_ids_str and saved_ids_str.strip():
-                        saved_ids = [s.strip() for s in saved_ids_str.split(",") if s.strip()]
-                    else:
-                        saved_ids = []
-
-                    restored_labels = []
-                    if not df_rep.empty:
-                        df_rep['Label'] = df_rep.apply(lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})", axis=1)
-                        # Sicherstellen, dass die Keys Strings sind
-                        id_to_label = dict(zip(df_rep['ID'].astype(str), df_rep['Label']))
+    # --- EDITIER-FUNKTION (Nur zeigen wenn im Modus NEU) ---
+    if st.session_state.gig_draft["event_id"] is None:
+        with st.expander("🛠 Bereits gespeicherten Auftritt bearbeiten", expanded=False):
+            if not df_events.empty:
+                df_events['Label'] = df_events.apply(lambda x: f"{x['Datum']} - {x['Location_Name']} ({x['Ensemble']})", axis=1)
+                df_events = df_events.sort_values(by='Datum_Obj', ascending=False)
+                
+                edit_options = ["Bitte wählen..."] + df_events['Label'].tolist()
+                edit_selection = st.selectbox("Wähle einen Auftritt:", edit_options)
+                
+                if st.button("Laden"):
+                    if edit_selection != "Bitte wählen...":
+                        row = df_events[df_events['Label'] == edit_selection].iloc[0]
+                        st.session_state.gig_draft["event_id"] = row['Event_ID']
+                        st.session_state.gig_draft["datum"] = datetime.datetime.strptime(row['Datum'], "%d.%m.%Y").date()
+                        try: st.session_state.gig_draft["uhrzeit"] = datetime.datetime.strptime(row['Uhrzeit'], "%H:%M").time()
+                        except: st.session_state.gig_draft["uhrzeit"] = datetime.time(19, 0)
+                        st.session_state.gig_draft["ensemble"] = row['Ensemble']
+                        st.session_state.gig_draft["location_selection"] = row['Location_Name']
                         
-                        for sid in saved_ids:
-                            if sid in id_to_label:
-                                restored_labels.append(id_to_label[sid])
-                                
-                    st.session_state.gig_draft["selected_songs"] = restored_labels
-                    st.toast("Geladen!", icon="✏️"); time.sleep(0.5); st.rerun()
-                else:
-                    st.session_state.gig_draft["event_id"] = None
-                    st.session_state.gig_draft["selected_songs"] = []
-                    st.toast("Reset", icon="🆕"); time.sleep(0.5); st.rerun()
-        else:
-            st.info("Keine gespeicherten Auftritte.")
+                        # ID WASCHMASCHINE HIER EINSETZEN
+                        saved_ids = clean_id_list(row['Songs_IDs'])
 
+                        restored_labels = []
+                        if not df_rep.empty:
+                            df_rep['Label'] = df_rep.apply(lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})", axis=1)
+                            id_to_label = dict(zip(df_rep['ID'].astype(str), df_rep['Label']))
+                            
+                            for sid in saved_ids:
+                                if sid in id_to_label:
+                                    restored_labels.append(id_to_label[sid])
+                                    
+                        st.session_state.gig_draft["selected_songs"] = restored_labels
+                        st.toast("Geladen!", icon="✏️"); time.sleep(0.5); st.rerun()
+            else:
+                st.info("Keine gespeicherten Auftritte.")
+
+    # --- HEADER & ZURÜCK BUTTON ---
     if st.session_state.gig_draft["event_id"]:
-        st.header(f"✏️ Bearbeiten (ID: {st.session_state.gig_draft['event_id']})")
+        # Spalten für Header und Zurück Button
+        col_back, col_head = st.columns([1, 3])
+        if col_back.button("⬅️ Zurück / Neu"):
+            reset_draft()
+            st.rerun()
+        col_head.header(f"✏️ Bearbeiten (ID: {st.session_state.gig_draft['event_id']})")
     else:
         st.header("📝 Neuen Auftritt erfassen")
 
@@ -286,7 +312,7 @@ if st.session_state.page == "speichern":
         
         st.markdown("---")
         
-        btn_text = "🔄 Aktualisieren" if st.session_state.gig_draft["event_id"] else "✅ Final speichern"
+        btn_text = "🔄 Änderungen speichern" if st.session_state.gig_draft["event_id"] else "✅ Final speichern"
         if st.button(btn_text, type="primary", use_container_width=True):
             errors = []
             if selected_loc == "Bitte wählen..." or (selected_loc == "➕ Neuer Ort..." and not final_loc_data.get("Name")):
@@ -308,6 +334,7 @@ if st.session_state.page == "speichern":
                     row = df_rep[df_rep['Label'] == label].iloc[0]
                     song_ids.append(str(row['ID']))
                 
+                # Sauber joinen (keine Leerzeichen)
                 row_data = [
                     datum_str, time_str, st.session_state.gig_draft["ensemble"],
                     final_loc_data["Name"], final_loc_data["Strasse"], str(final_loc_data["PLZ"]), final_loc_data["Stadt"],
@@ -316,22 +343,20 @@ if st.session_state.page == "speichern":
                 
                 if st.session_state.gig_draft["event_id"]:
                     success = update_event_in_db(st.session_state.gig_draft["event_id"], row_data)
+                    msg = "Aktualisiert!"
                 else:
                     ws_ev = sh.worksheet("Events"); col_ids = ws_ev.col_values(1)[1:]
                     e_ids = [int(x) for x in col_ids if str(x).isdigit()]
                     new_ev_id = max(e_ids) + 1 if e_ids else 1
                     ws_ev.append_row([new_ev_id] + row_data)
-                    clear_all_caches() 
+                    clear_all_caches()
                     success = True
+                    msg = "Gespeichert!"
                 
                 if success:
                     st.balloons()
-                    st.success(f"Gespeichert: {dateiname}")
-                    st.session_state.gig_draft = {
-                        "event_id": None, "datum": datetime.date.today(), "uhrzeit": datetime.time(19, 0),
-                        "ensemble": "Tutti", "location_selection": "Bitte wählen...", 
-                        "new_loc_data": {}, "selected_songs": []
-                    }
+                    st.success(f"{msg} Setlist: {dateiname}")
+                    reset_draft()
                     time.sleep(2); st.rerun()
 
     else: st.warning("Repertoire leer.")
