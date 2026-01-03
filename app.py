@@ -3,7 +3,6 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
 import datetime
 import time
 import os
@@ -16,19 +15,22 @@ DB_NAME = "GEMA_Datenbank"
 
 st.set_page_config(page_title="GEMA Manager", page_icon="xj", layout="centered")
 
-# --- INITIALISIERUNG & RESET-LOGIK (WICHTIG: GANZ OBEN) ---
+# --- INITIALISIERUNG & RESET-LOGIK ---
 
-# Hilfsfunktion zum Zurücksetzen
-def reset_draft_logic():
+def reset_draft_logic(keep_download=False):
+    """Setzt das Formular zurück. Optional: Behält den Download-Button."""
     st.session_state.gig_draft = {
         "event_id": None, "datum": datetime.date.today(), "uhrzeit": datetime.time(19, 0),
         "ensemble": "Tutti", "location_selection": "Bitte wählen...", 
         "new_loc_data": {}
     }
     st.session_state.gig_song_selector = []
-    st.session_state.last_download = None
+    
+    # WICHTIG: Download nur löschen, wenn nicht explizit behalten gewünscht
+    if not keep_download:
+        st.session_state.last_download = None
 
-# 1. State Variablen initialisieren
+# State Variablen
 if 'gig_draft' not in st.session_state: reset_draft_logic()
 if 'gig_song_selector' not in st.session_state: st.session_state.gig_song_selector = []
 if 'rep_edit_state' not in st.session_state: st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
@@ -37,9 +39,9 @@ if 'db_checked' not in st.session_state: st.session_state.db_checked = False
 if 'last_download' not in st.session_state: st.session_state.last_download = None
 if 'trigger_reset' not in st.session_state: st.session_state.trigger_reset = False
 
-# 2. Prüfen, ob ein Reset angefordert wurde (Der Fix für den Fehler!)
+# Reset Auslöser (mit Download-Schutz)
 if st.session_state.trigger_reset:
-    reset_draft_logic()
+    reset_draft_logic(keep_download=True)
     st.session_state.trigger_reset = False
     st.rerun()
 
@@ -101,7 +103,6 @@ def generate_excel_bytes(template_file_id, datum, uhrzeit, ensemble, ort_data, s
         wb = openpyxl.load_workbook(template_stream)
         ws = wb.active 
         
-        # Header (Anpassbar)
         safe_write(ws, 1, 2, ensemble)
         safe_write(ws, 2, 2, datum)
         safe_write(ws, 3, 2, ort_data.get('Stadt', ''))
@@ -253,10 +254,10 @@ if st.session_state.page == "speichern":
     df_rep = get_data_repertoire()
     df_events = get_data_events()
     
-    # 1. DOWNLOAD BUTTON (Wenn Datei bereitsteht)
+    # 1. DOWNLOAD BUTTON (bleibt jetzt stehen!)
     if st.session_state.last_download:
         d_name, d_bytes = st.session_state.last_download
-        st.success("🎉 Datei wurde erfolgreich erstellt!")
+        st.success("🎉 Datei fertig! Bitte herunterladen (Upload nicht möglich wegen Google Quota).")
         st.download_button(
             label=f"📥 {d_name} herunterladen",
             data=d_bytes,
@@ -264,6 +265,7 @@ if st.session_state.page == "speichern":
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary"
         )
+        st.info("ℹ️ Die Datei wurde lokal generiert. Du kannst sie jetzt manuell in dein Google Drive laden.")
         st.divider()
 
     # 2. Editier-Auswahl
@@ -292,8 +294,11 @@ if st.session_state.page == "speichern":
 
     if st.session_state.gig_draft["event_id"]:
         cb, ch = st.columns([1,3])
-        # ZURÜCK BUTTON FIX (on_click verwendet die Reset-Logik direkt)
-        cb.button("⬅️ Zurück", on_click=reset_draft_logic) 
+        # Zurück löscht auch den Download Button
+        if cb.button("⬅️ Zurück"): 
+            st.session_state.trigger_reset = True
+            st.session_state.last_download = None
+            st.rerun()
         ch.header(f"✏️ Bearbeiten (ID: {st.session_state.gig_draft['event_id']})")
     else: st.header("📝 Neuen Auftritt erfassen")
 
@@ -314,10 +319,16 @@ if st.session_state.page == "speichern":
     if sel_loc == "➕ Neuer Ort...":
         with st.form("new_loc_form"):
             n = st.text_input("Name*"); s = st.text_input("Str."); p = st.text_input("PLZ"); ci = st.text_input("Stadt*")
+            # NEU: SOFORT SPEICHERN
             if st.form_submit_button("Bestätigen"):
-                st.session_state.gig_draft["new_loc_data"] = {"Name": n, "Strasse": s, "PLZ": p, "Stadt": ci}
-                st.rerun()
-        if st.session_state.gig_draft["new_loc_data"]: final_loc = st.session_state.gig_draft["new_loc_data"]
+                if n and ci:
+                    save_location_direct(n, s, p, ci)
+                    st.session_state.gig_draft["location_selection"] = n # Auto-Select
+                    st.toast(f"Ort '{n}' gespeichert!", icon="✅")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    st.error("Name und Stadt sind Pflicht!")
     elif sel_loc != "Bitte wählen...":
         final_loc = df_loc[df_loc['Name'] == sel_loc].iloc[0].to_dict()
 
@@ -350,11 +361,8 @@ if st.session_state.page == "speichern":
         
         if st.button(btn_txt, type="primary", use_container_width=True):
             if not final_loc.get("Name") or not selection or not selected_template_id:
-                st.error("Daten fehlen!")
+                st.error("Daten fehlen! (Ort, Programm oder Template)")
             else:
-                if sel_loc == "➕ Neuer Ort...":
-                    save_location_direct(final_loc["Name"], final_loc["Strasse"], final_loc["PLZ"], final_loc["Stadt"])
-                
                 datum_str = st.session_state.gig_draft["datum"].strftime("%d.%m.%Y")
                 time_str = st.session_state.gig_draft["uhrzeit"].strftime("%H:%M")
                 dateiname = f"{st.session_state.gig_draft['ensemble']}{datum_str}{final_loc['Stadt']}Setlist.xlsx"
@@ -386,10 +394,7 @@ if st.session_state.page == "speichern":
                             ws_ev.append_row([new_ev_id] + row_data)
                             clear_all_caches()
                         
-                        # Datei für Download speichern
                         st.session_state.last_download = (dateiname, excel_bytes.getvalue())
-                        
-                        # RESET ÜBER FLAGGE (Der Fix!)
                         st.session_state.trigger_reset = True
                         st.rerun()
     else: st.warning("Repertoire leer.")
