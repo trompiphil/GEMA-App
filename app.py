@@ -8,7 +8,7 @@ import datetime
 import time
 import os
 import openpyxl
-from openpyxl.cell.cell import MergedCell # WICHTIG FÜR DEN FIX
+from openpyxl.cell.cell import MergedCell # Wichtig für Excel Fix
 
 # --- KONFIGURATION ---
 DB_NAME = "GEMA_Datenbank"
@@ -40,21 +40,31 @@ try:
     client, drive_service = get_gspread_client()
     sh = client.open(DB_NAME)
 except Exception as e:
-    st.error(f"Verbindungsfehler: {e}"); st.stop()
+    st.error(f"Verbindungsfehler zur Datenbank: {e}"); st.stop()
 
-# --- DRIVE HELPER ---
+# --- DRIVE HELPER (Strict Mode) ---
 
-def get_folder_id(folder_name):
+def get_folder_id_strict(folder_name, parent_id=None):
+    """Sucht Ordner. Wenn parent_id gegeben, muss er darin sein."""
     query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+    
     results = drive_service.files().list(q=query, fields="files(id, name)").execute()
     items = results.get('files', [])
     if items: return items[0]['id']
     return None
 
 def list_files_in_templates():
-    fid = get_folder_id("Templates")
-    if not fid: return [], "Ordner 'Templates' nicht gefunden!"
-    query = f"'{fid}' in parents and trashed = false"
+    # 1. Hauptordner suchen
+    root_id = get_folder_id_strict("GEMA Bpol")
+    if not root_id: return [], "Hauptordner 'GEMA Bpol' nicht gefunden! Bitte mit Bot teilen."
+    
+    # 2. Templates darin suchen
+    temp_id = get_folder_id_strict("Templates", parent_id=root_id)
+    if not temp_id: return [], "Ordner 'Templates' (innerhalb von GEMA Bpol) nicht gefunden."
+
+    query = f"'{temp_id}' in parents and trashed = false"
     results = drive_service.files().list(q=query, fields="files(id, name)").execute()
     return results.get('files', []), None
 
@@ -65,16 +75,13 @@ def download_specific_template(file_id, filename_save_as):
         return True, None
     except Exception as e: return False, str(e)
 
-# --- EXCEL HELPER (DER FIX) ---
+# --- EXCEL HELPER (Fix für verbundene Zellen) ---
 
 def safe_write(ws, row, col, value):
-    """Schreibt in eine Zelle, auch wenn sie verbunden ist."""
     cell = ws.cell(row=row, column=col)
     if isinstance(cell, MergedCell):
-        # Wenn Zelle teil eines Verbunds ist: Finde den "Parent" (oben links)
         for merged_range in ws.merged_cells.ranges:
             if cell.coordinate in merged_range:
-                # Wir schreiben in die Top-Left Zelle des Verbunds
                 top_left = ws.cell(row=merged_range.min_row, column=merged_range.min_col)
                 top_left.value = value
                 break
@@ -82,76 +89,73 @@ def safe_write(ws, row, col, value):
         cell.value = value
 
 def generate_and_upload_excel(template_file_id, datum, uhrzeit, ensemble, ort_data, songs_list, filename):
+    # 1. Download
     local_temp = "temp_template.xlsx"
     ok, err = download_specific_template(template_file_id, local_temp)
     if not ok: return None, f"Download Fehler: {err}"
 
+    # 2. Excel schreiben
     try:
         wb = openpyxl.load_workbook(local_temp)
         ws = wb.active 
         
-        # Header schreiben
-        safe_write(ws, 1, 2, ensemble) # B1
-        safe_write(ws, 2, 2, datum)    # B2
-        safe_write(ws, 3, 2, ort_data.get('Stadt', '')) # B3
+        # Header schreiben (Sicheres Schreiben)
+        safe_write(ws, 1, 2, ensemble)
+        safe_write(ws, 2, 2, datum)
+        safe_write(ws, 3, 2, ort_data.get('Stadt', ''))
         
         start_row = 14
         current_row = start_row
         
-        # --- 1. LEEREN (Robust gegen Merged Cells) ---
+        # Leeren (Vorsicht mit Merged Cells)
         for row in ws.iter_rows(min_row=start_row, max_row=100):
             for cell in row:
-                # WICHTIG: Nicht versuchen, MergedCells zu leeren!
-                if isinstance(cell, MergedCell):
-                    continue
-                cell.value = None
+                if not isinstance(cell, MergedCell):
+                    cell.value = None
 
-        # --- 2. BEFÜLLEN (Mit safe_write) ---
+        # Füllen
         for song in songs_list:
             safe_write(ws, current_row, 2, song['Titel']) # B
             safe_write(ws, current_row, 5, song['Dauer']) # E
-            
             k_name = f"{song['Komponist_Nachname']}, {song['Komponist_Vorname']}"
             safe_write(ws, current_row, 6, k_name) # F
-            
             if song['Bearbeiter_Nachname']:
                 b_name = f"{song['Bearbeiter_Nachname']}, {song['Bearbeiter_Vorname']}"
                 safe_write(ws, current_row, 16, b_name) # P
-            
             safe_write(ws, current_row, 10, song['Verlag']) # J
             safe_write(ws, current_row, 11, "Live") # K
-            
             current_row += 1
             
         wb.save(filename)
-        
     except Exception as e:
-        return None, f"Excel Schreibfehler: {e}"
+        return None, f"Excel Fehler: {e}"
 
-    # Upload
+    # 3. Upload (QUOTA FIX)
     try:
-        output_folder_id = get_folder_id("Output")
-        if not output_folder_id:
-            parent_id = get_folder_id("GEMA Bpol")
-            if parent_id:
-                file_metadata = {'name': 'Output', 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}
-                folder = drive_service.files().create(body=file_metadata, fields='id').execute()
-                output_folder_id = folder.get('id')
-            else:
-                # Notfall: Root
-                file_metadata = {'name': 'Output', 'mimeType': 'application/vnd.google-apps.folder'}
-                folder = drive_service.files().create(body=file_metadata, fields='id').execute()
-                output_folder_id = folder.get('id')
+        # A) Hauptordner finden
+        root_id = get_folder_id_strict("GEMA Bpol")
+        if not root_id: return None, "Fehler: Ordner 'GEMA Bpol' nicht gefunden. Upload unmöglich."
+        
+        # B) Output Ordner finden (MUSS existieren)
+        output_id = get_folder_id_strict("Output", parent_id=root_id)
+        if not output_id:
+            # Letzter Versuch: Vielleicht heißt er anders oder liegt woanders? Suche global
+            output_id = get_folder_id_strict("Output")
+            if not output_id:
+                return None, "Fehler: Ordner 'Output' nicht gefunden! Bitte erstelle ihn im Ordner 'GEMA Bpol'."
 
-        file_metadata = {'name': filename, 'parents': [output_folder_id]}
+        # C) Upload direkt in den gefundenen Ordner (kein Erstellen!)
+        file_metadata = {'name': filename, 'parents': [output_id]}
         media = MediaFileUpload(filename, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         
         file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
         
+        # Cleanup
         if os.path.exists(local_temp): os.remove(local_temp)
         if os.path.exists(filename): os.remove(filename)
         
         return file.get('webViewLink'), None
+
     except Exception as e:
         return None, f"Upload Fehler: {e}"
 
