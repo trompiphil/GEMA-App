@@ -8,7 +8,7 @@ import datetime
 # --- KONFIGURATION ---
 DB_NAME = "GEMA_Datenbank"
 FOLDER_NAME_TEMPLATES = "Templates"
-TEMPLATE_FILENAME = "Setlist_Template.xlsx" # Wie du die Datei im Drive genannt hast
+TEMPLATE_FILENAME = "Setlist_Template.xlsx" 
 OUTPUT_FOLDER_NAME = "Output"
 
 # --- SETUP & VERBINDUNG ---
@@ -37,15 +37,23 @@ except Exception as e:
 
 def init_db():
     """Erstellt die Tabellenblätter und Spalten, falls die DB leer ist."""
+    # 1. Repertoire
     try:
         ws_rep = sh.worksheet("Repertoire")
     except:
-        ws_rep = sh.add_worksheet(title="Repertoire", rows=100, cols=10)
+        ws_rep = sh.add_worksheet(title="Repertoire", rows=100, cols=15)
     
-    # Prüfen ob Header da sind, sonst schreiben
+    # Header schreiben (nur wenn Zeile 1 leer ist)
     if not ws_rep.row_values(1):
-        ws_rep.update('A1:H1', [['ID', 'Titel', 'Komponist_Nachname', 'Komponist_Vorname', 'Bearbeiter', 'Dauer', 'Verlag', 'Werkeart']])
+        headers = [
+            'ID', 'Titel', 
+            'Komponist_Nachname', 'Komponist_Vorname', 
+            'Bearbeiter_Nachname', 'Bearbeiter_Vorname', 
+            'Dauer', 'Verlag', 'Werkeart', 'ISWC'
+        ]
+        ws_rep.update('A1:J1', [headers])
 
+    # 2. Events
     try:
         ws_ev = sh.worksheet("Events")
     except:
@@ -59,95 +67,129 @@ def load_repertoire():
     data = ws.get_all_records()
     return pd.DataFrame(data)
 
-def add_song(titel, komp_nach, komp_vor, bearbeiter, dauer, verlag):
+def add_song(titel, k_nach, k_vor, b_nach, b_vor, dauer, verlag):
     ws = sh.worksheet("Repertoire")
-    # Neue ID berechnen (Max ID + 1)
-    col_ids = ws.col_values(1)[1:] # ohne Header
+    # Neue ID berechnen
+    col_ids = ws.col_values(1)[1:] 
     if not col_ids:
         new_id = 1
     else:
-        new_id = max([int(x) for x in col_ids if str(x).isdigit()]) + 1
+        # Sicherstellen, dass wir nur Zahlen nehmen
+        ids = [int(x) for x in col_ids if str(x).isdigit()]
+        new_id = max(ids) + 1 if ids else 1
         
-    row = [new_id, titel, komp_nach, komp_vor, bearbeiter, dauer, verlag, "U-Musik"]
+    row = [
+        new_id, titel, 
+        k_nach, k_vor, 
+        b_nach, b_vor, 
+        dauer, verlag, 
+        "U-Musik", "" # ISWC erst mal leer
+    ]
     ws.append_row(row)
 
 # --- APP UI ---
 
 st.title("Orchester Manager 🎻")
 
-# Datenbank initialisieren (passiert lautlos im Hintergrund)
+# DB Check
 init_db()
 
-# Tabs für Navigation
 tab1, tab2, tab3 = st.tabs(["➕ Repertoire", "📅 Neuer Auftritt", "⚙️ Einstellungen"])
 
-# --- TAB 1: REPERTOIRE PFLEGEN ---
+# --- TAB 1: REPERTOIRE ---
 with tab1:
     st.header("Neues Stück erfassen")
+    
     with st.form("new_song_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        f_titel = col1.text_input("Titel")
-        f_dauer = col2.text_input("Dauer (MM:SS)", value="03:00")
+        st.caption("Pflichtfelder sind fett markiert")
         
-        col3, col4 = st.columns(2)
-        f_komp_n = col3.text_input("Komponist Nachname")
-        f_komp_v = col4.text_input("Komponist Vorname")
+        # Zeile 1: Titel & Dauer
+        c1, c2 = st.columns([3, 1])
+        f_titel = c1.text_input("**Titel**")
+        f_dauer = c2.text_input("**Dauer (MM:SS)**", value="03:00")
+        
+        st.markdown("---")
+        
+        # Zeile 2: Komponist
+        c3, c4 = st.columns(2)
+        f_komp_n = c3.text_input("**Komponist Nachname**")
+        f_komp_v = c4.text_input("Komponist Vorname")
+        
+        # Zeile 3: Bearbeiter
+        c5, c6 = st.columns(2)
+        f_bearb_n = c5.text_input("Bearbeiter Nachname (optional)")
+        f_bearb_v = c6.text_input("Bearbeiter Vorname (optional)")
+        
+        st.markdown("---")
         
         f_verlag = st.text_input("Verlag")
         
         submitted = st.form_submit_button("Speichern")
-        if submitted and f_titel and f_komp_n:
-            add_song(f_titel, f_komp_n, f_komp_v, "", f_dauer, f_verlag)
-            st.success(f"'{f_titel}' gespeichert!")
-            st.rerun() # Seite neu laden um Tabelle zu aktualisieren
+        
+        if submitted:
+            if not f_titel or not f_komp_n:
+                st.error("Bitte mindestens Titel und Komponist Nachname angeben.")
+            else:
+                add_song(f_titel, f_komp_n, f_komp_v, f_bearb_n, f_bearb_v, f_dauer, f_verlag)
+                st.success(f"'{f_titel}' wurde gespeichert!")
+                st.rerun()
 
     st.divider()
-    st.subheader("Aktuelles Repertoire")
+    
+    # Anzeige Repertoire
     df_rep = load_repertoire()
     if not df_rep.empty:
-        # Suche
-        search = st.text_input("Suche im Repertoire", "")
+        search = st.text_input("Suche im Repertoire", "", placeholder="Titel oder Komponist...")
         if search:
             mask = df_rep.apply(lambda x: x.astype(str).str.contains(search, case=False).any(), axis=1)
             df_rep = df_rep[mask]
         
-        st.dataframe(df_rep, use_container_width=True)
+        # Schöne Tabelle anzeigen
+        st.dataframe(
+            df_rep, 
+            column_config={
+                "ID": None, # ID verstecken
+                "Komponist_Nachname": "Komponist",
+                "Bearbeiter_Nachname": "Bearbeiter"
+            },
+            hide_index=True,
+            use_container_width=True
+        )
     else:
-        st.info("Noch keine Stücke in der Datenbank.")
+        st.info("Datenbank ist noch leer.")
 
-# --- TAB 2: GIG ERSTELLEN ---
+# --- TAB 2: GIG ---
 with tab2:
-    st.header("Setliste erstellen")
+    st.header("Setliste planen")
     
     col_a, col_b = st.columns(2)
     inp_date = col_a.date_input("Datum", datetime.date.today())
     inp_ens = col_b.selectbox("Ensemble", ["Tutti", "BQ", "Quartett", "Duo"])
+    inp_ort = st.text_input("Ort", "Eschwege")
     
-    inp_ort = st.text_input("Ort (für Dateiname)", "Eschwege")
-    
-    # Song Auswahl
     df_rep = load_repertoire()
+    
     if not df_rep.empty:
-        df_rep['Anzeige'] = df_rep['Titel'] + " (" + df_rep['Komponist_Nachname'] + ")"
-        selected_songs = st.multiselect("Stücke auswählen (Reihenfolge beachten!)", df_rep['Anzeige'].tolist())
+        # Anzeige für Dropdown zusammenbauen
+        df_rep['Label'] = df_rep.apply(
+            lambda x: f"{x['Titel']} ({x['Komponist_Nachname']})" + (f" / Arr: {x['Bearbeiter_Nachname']}" if x['Bearbeiter_Nachname'] else ""), 
+            axis=1
+        )
+        
+        selected_labels = st.multiselect("Programm wählen", df_rep['Label'].tolist())
         
         if st.button("Setliste generieren"):
-            # 1. Dateinamen bauen
             datum_str = inp_date.strftime("%d.%m.%Y")
             dateiname = f"{inp_ens}{datum_str}{inp_ort}Setlist.xlsx"
             
-            st.info(f"Erstelle Datei: {dateiname} ... (Funktion folgt im nächsten Schritt)")
-            
-            # HIER KOMMT GLEICH DIE EXCEL-LOGIK HIN
-            # Wir speichern erstmal nur das Event in die Datenbank
-            ws_ev = sh.worksheet("Events")
-            # IDs der Songs finden
+            # IDs holen
             song_ids = []
-            for s in selected_songs:
-                # Einfache Suche nach ID (könnte man eleganter lösen)
-                row = df_rep[df_rep['Anzeige'] == s].iloc[0]
+            for label in selected_labels:
+                row = df_rep[df_rep['Label'] == label].iloc[0]
                 song_ids.append(str(row['ID']))
             
+            # Event speichern
+            ws_ev = sh.worksheet("Events")
             ws_ev.append_row([
                 str(datetime.datetime.now()), 
                 datum_str, 
@@ -156,12 +198,11 @@ with tab2:
                 dateiname, 
                 ",".join(song_ids)
             ])
-            st.success("Veranstaltung in Datenbank gespeichert!")
             
-    else:
-        st.warning("Bitte erst Stücke im Repertoire erfassen.")
+            st.success(f"Auftritt gespeichert! (Datei-Generierung folgt)")
+            st.json({"Datei": dateiname, "Songs": selected_labels})
 
 # --- TAB 3: SETTINGS ---
 with tab3:
-    st.write("Verbindung zur Datenbank: OK ✅")
-    st.write(f"Datenbank-Datei: {DB_NAME}")
+    st.write(f"Datenbank: {DB_NAME}")
+    st.write("Hier kommen später Dropdown-Einstellungen hin.")
