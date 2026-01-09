@@ -16,18 +16,22 @@ DB_NAME = "GEMA_Datenbank"
 
 st.set_page_config(page_title="GEMA Manager", page_icon="xj", layout="centered")
 
-# --- RESET & STATE ---
+# --- 1. SESSION STATE & NAVIGATION (JETZT GANZ OBEN) ---
+
 def reset_draft_logic(keep_download=False):
+    """Setzt das Formular zurück."""
     st.session_state.gig_draft = {
         "event_id": None, "datum": datetime.date.today(), "uhrzeit": datetime.time(19, 0),
         "ensemble": "Tutti", "location_selection": "Bitte wählen...", 
         "new_loc_data": {}
     }
     st.session_state.gig_song_selector = []
+    
     if not keep_download:
         st.session_state.last_download = None
         st.session_state.uploaded_file_link = None
 
+# Variablen initialisieren
 if 'gig_draft' not in st.session_state: reset_draft_logic()
 if 'gig_song_selector' not in st.session_state: st.session_state.gig_song_selector = []
 if 'rep_edit_state' not in st.session_state: st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
@@ -37,10 +41,27 @@ if 'last_download' not in st.session_state: st.session_state.last_download = Non
 if 'uploaded_file_link' not in st.session_state: st.session_state.uploaded_file_link = None
 if 'trigger_reset' not in st.session_state: st.session_state.trigger_reset = False
 
+# Reset Trigger
 if st.session_state.trigger_reset:
     reset_draft_logic(keep_download=True)
     st.session_state.trigger_reset = False
     st.rerun()
+
+# DEFINITION DER NAVIGATION (Hier oben ist sie sicher!)
+def navigation_bar():
+    st.markdown("---")
+    c1, c2, c3, c4 = st.columns(4)
+    if c1.button("💾 Speichern / Edit", use_container_width=True, type="primary" if st.session_state.page == "speichern" else "secondary"): 
+        st.session_state.page = "speichern"; st.rerun()
+    if c2.button("🎵 Repertoire", use_container_width=True, type="primary" if st.session_state.page == "repertoire" else "secondary"): 
+        st.session_state.page = "repertoire"; st.rerun()
+    if c3.button("📍 Orte", use_container_width=True, type="primary" if st.session_state.page == "orte" else "secondary"): 
+        st.session_state.page = "orte"; st.rerun()
+    if c4.button("📂 Archiv", use_container_width=True, type="primary" if st.session_state.page == "archiv" else "secondary"): 
+        st.session_state.page = "archiv"; st.rerun()
+    st.markdown("---")
+
+# --- 2. GOOGLE DIENSTE ---
 
 @st.cache_resource
 def get_gspread_client():
@@ -57,7 +78,8 @@ try:
 except Exception as e:
     st.error(f"Verbindungsfehler: {e}"); st.stop()
 
-# --- DRIVE HELPER ---
+# --- 3. HELPER FUNKTIONEN (DRIVE & EXCEL) ---
+
 def get_folder_id(folder_name, parent_id=None):
     query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     if parent_id: query += f" and '{parent_id}' in parents"
@@ -70,10 +92,11 @@ def get_folder_id(folder_name, parent_id=None):
 
 def list_files_in_templates():
     root_id = get_folder_id("GEMA Bpol")
-    if not root_id: return [], "Hauptordner 'GEMA Bpol' fehlt."
+    if not root_id: return [], "Hauptordner 'GEMA Bpol' nicht gefunden."
     fid = get_folder_id("Templates", parent_id=root_id)
-    if not fid: fid = get_folder_id("Templates") # Fallback
-    if not fid: return [], "Ordner 'Templates' fehlt."
+    if not fid: fid = get_folder_id("Templates") 
+    if not fid: return [], "Ordner 'Templates' nicht gefunden."
+    
     query = f"'{fid}' in parents and trashed = false"
     results = drive_service.files().list(q=query, fields="files(id, name)").execute()
     return results.get('files', []), None
@@ -85,8 +108,8 @@ def download_specific_template(file_id, local_filename):
         return True, None
     except Exception as e: return False, str(e)
 
-# --- EXCEL HELPER ---
 def safe_write(ws, row, col, value):
+    """Schreibt in Zelle, ignoriert MergedCell Fehler"""
     try:
         cell = ws.cell(row=row, column=col)
         if isinstance(cell, MergedCell):
@@ -107,28 +130,24 @@ def process_and_upload_excel(template_file_id, datum, uhrzeit, ensemble, ort_dat
         wb = openpyxl.load_workbook(local_temp)
         ws = wb.active 
         
-        # --- WICHTIG: KEIN SCHREIBEN IN ZEILEN 1-20 ---
-        # Wir fassen den Header nicht an, um Formatierung (rote Sternchen) zu schützen.
-        
+        # Header NICHT anfassen (Zeile 1-20 geschützt)
         start_row = 21
         current_row = start_row
         
-        # Leeren (ab Zeile 21)
-        # Spalten: B(2), E(5), F(6), G(7), J(10), P(16), Q(17)
-        cols = [2, 5, 6, 7, 10, 16, 17]
+        # Leeren ab Zeile 21
+        cols = [2, 5, 6, 7, 10, 16, 17] # B,E,F,G,J,P,Q
         for r in range(start_row, 100):
             for c in cols: safe_write(ws, r, c, None)
 
         # Befüllen
         for song in songs_list:
-            safe_write(ws, current_row, 2, song['Titel']) # B21 ff
-            safe_write(ws, current_row, 5, song['Dauer']) # E21 ff
-            safe_write(ws, current_row, 6, song['Komponist_Nachname']) # F21 ff
-            safe_write(ws, current_row, 7, song['Komponist_Vorname']) # G21 ff
-            safe_write(ws, current_row, 10, song['Verlag']) # J21 ff
-            safe_write(ws, current_row, 16, song['Bearbeiter_Nachname']) # P21 ff
-            safe_write(ws, current_row, 17, song['Bearbeiter_Vorname']) # Q21 ff
-            
+            safe_write(ws, current_row, 2, song['Titel']) 
+            safe_write(ws, current_row, 5, song['Dauer']) 
+            safe_write(ws, current_row, 6, song['Komponist_Nachname']) 
+            safe_write(ws, current_row, 7, song['Komponist_Vorname']) 
+            safe_write(ws, current_row, 10, song['Verlag']) 
+            safe_write(ws, current_row, 16, song['Bearbeiter_Nachname']) 
+            safe_write(ws, current_row, 17, song['Bearbeiter_Vorname']) 
             current_row += 1
             
         wb.save(target_filename)
@@ -140,7 +159,7 @@ def process_and_upload_excel(template_file_id, datum, uhrzeit, ensemble, ort_dat
     except Exception as e:
         return None, None, f"Excel Fehler: {e}"
 
-    # 3. Upload (MIT ERROR HANDLING FÜR QUOTA)
+    # 3. Upload (Safe Mode)
     web_link = "Lokal"
     try:
         root_id = get_folder_id("GEMA Bpol")
@@ -152,15 +171,15 @@ def process_and_upload_excel(template_file_id, datum, uhrzeit, ensemble, ort_dat
                 file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
                 web_link = file.get('webViewLink')
     except Exception:
-        # Wir ignorieren Upload Fehler (Quota), damit der Download Button trotzdem kommt
-        web_link = "Upload gescheitert (Quota)"
+        web_link = "Upload gescheitert (Quota)" # Fehler abfangen, nicht abstürzen
 
     if os.path.exists(local_temp): os.remove(local_temp)
     if os.path.exists(target_filename): os.remove(target_filename)
 
     return output_bytes, web_link, None
 
-# --- DB & UI ---
+# --- 4. DB FUNKTIONEN ---
+
 def check_and_fix_db():
     if st.session_state.db_checked: return
     try: 
@@ -235,13 +254,16 @@ def update_event_in_db(eid, data):
         clear_all_caches(); return True
     except: return False
 
-# --- UI ---
-navigation_bar()
+# --- 5. APP UI (MAIN) ---
+
 check_and_fix_db()
+st.title("Orchester Manager 🎻")
+navigation_bar() # Jetzt sicher aufrufbar!
 
 if st.session_state.page == "speichern":
     df_loc = get_data_locations(); df_rep = get_data_repertoire(); df_events = get_data_events()
     
+    # Download Button
     if st.session_state.last_download:
         d_name, d_bytes = st.session_state.last_download
         cloud_stat = st.session_state.uploaded_file_link
@@ -249,9 +271,10 @@ if st.session_state.page == "speichern":
         c1, c2 = st.columns(2)
         c1.download_button(f"📥 {d_name}", d_bytes, d_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
         if "http" in str(cloud_stat): c2.link_button("☁️ Drive Link", cloud_stat, use_container_width=True)
-        else: c2.warning("⚠️ Cloud Upload voll (Quota). Bitte lokal speichern.")
+        else: c2.warning("⚠️ Cloud Upload voll. Lokal speichern.")
         st.divider()
 
+    # Editier-Auswahl
     if not st.session_state.gig_draft["event_id"]:
         with st.expander("🛠 Bearbeiten"):
             if not df_events.empty:
@@ -264,6 +287,7 @@ if st.session_state.page == "speichern":
                     st.session_state.gig_song_selector = df_rep[df_rep['ID'].isin(ids)]['Label'].tolist() if not df_rep.empty else []
                     st.session_state.last_download = None; st.rerun()
 
+    # Formular
     if st.session_state.gig_draft["event_id"]:
         if st.button("⬅️ Zurück"): 
             st.session_state.trigger_reset = True; st.rerun()
@@ -291,7 +315,7 @@ if st.session_state.page == "speichern":
                 if n and c:
                     save_location_direct(n,s,p,c)
                     st.session_state.gig_draft["location_selection"] = n
-                    st.rerun()
+                    st.toast("Gespeichert!", icon="✅"); time.sleep(1); st.rerun()
                 else: st.error("Name/Stadt fehlt")
     elif sel_loc != "Wählen...":
         fin_loc = df_loc[df_loc['Name']==sel_loc].iloc[0].to_dict()
@@ -353,7 +377,7 @@ if st.session_state.page == "speichern":
                             st.session_state.trigger_reset = True
                             st.rerun()
 
-# --- ANDERE SEITEN (Kurzform) ---
+# --- ANDERE SEITEN ---
 elif st.session_state.page == "repertoire":
     st.subheader("Repertoire")
     mode = st.radio("Modus", ["Neu", "Edit"], horizontal=True)
