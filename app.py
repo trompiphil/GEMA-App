@@ -3,6 +3,7 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 import datetime
 import time
 import os
@@ -18,7 +19,7 @@ st.set_page_config(page_title="GEMA Manager", page_icon="xj", layout="centered")
 # --- INITIALISIERUNG & RESET-LOGIK ---
 
 def reset_draft_logic(keep_download=False):
-    """Setzt das Formular zurück. Optional: Behält den Download-Button."""
+    """Setzt das Formular zurück."""
     st.session_state.gig_draft = {
         "event_id": None, "datum": datetime.date.today(), "uhrzeit": datetime.time(19, 0),
         "ensemble": "Tutti", "location_selection": "Bitte wählen...", 
@@ -26,9 +27,9 @@ def reset_draft_logic(keep_download=False):
     }
     st.session_state.gig_song_selector = []
     
-    # WICHTIG: Download nur löschen, wenn nicht explizit behalten gewünscht
     if not keep_download:
         st.session_state.last_download = None
+        st.session_state.uploaded_file_link = None
 
 # State Variablen
 if 'gig_draft' not in st.session_state: reset_draft_logic()
@@ -37,9 +38,10 @@ if 'rep_edit_state' not in st.session_state: st.session_state.rep_edit_state = {
 if 'page' not in st.session_state: st.session_state.page = "speichern"
 if 'db_checked' not in st.session_state: st.session_state.db_checked = False
 if 'last_download' not in st.session_state: st.session_state.last_download = None
+if 'uploaded_file_link' not in st.session_state: st.session_state.uploaded_file_link = None
 if 'trigger_reset' not in st.session_state: st.session_state.trigger_reset = False
 
-# Reset Auslöser (mit Download-Schutz)
+# Reset Auslöser
 if st.session_state.trigger_reset:
     reset_draft_logic(keep_download=True)
     st.session_state.trigger_reset = False
@@ -60,10 +62,14 @@ try:
 except Exception as e:
     st.error(f"Verbindungsfehler: {e}"); st.stop()
 
-# --- HELPER FUNKTIONEN ---
+# --- HELPER FUNKTIONEN (DRIVE) ---
 
-def get_folder_id(folder_name):
+def get_folder_id(folder_name, parent_id=None):
+    """Sucht Ordner ID, optional in einem bestimmten Eltern-Ordner"""
     query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+    
     try:
         results = drive_service.files().list(q=query, fields="files(id)").execute()
         items = results.get('files', [])
@@ -72,67 +78,146 @@ def get_folder_id(folder_name):
     return None
 
 def list_files_in_templates():
-    fid = get_folder_id("Templates")
-    if not fid: return [], "Ordner 'Templates' nicht gefunden."
+    # Wir suchen erst den Hauptordner, um sicherzugehen
+    root_id = get_folder_id("GEMA Bpol")
+    if not root_id: return [], "Hauptordner 'GEMA Bpol' nicht gefunden. Bitte Ordner erstellen und mit Bot teilen!"
+    
+    # Dann Templates darin
+    fid = get_folder_id("Templates", parent_id=root_id)
+    if not fid: 
+        # Fallback: Suche Templates global
+        fid = get_folder_id("Templates")
+        if not fid: return [], "Ordner 'Templates' nicht gefunden."
+
     query = f"'{fid}' in parents and trashed = false"
     results = drive_service.files().list(q=query, fields="files(id, name)").execute()
     return results.get('files', []), None
 
-def download_specific_template(file_id):
+def download_specific_template(file_id, local_filename):
     try:
         content = drive_service.files().get_media(fileId=file_id).execute()
-        return BytesIO(content), None
-    except Exception as e: return None, str(e)
+        with open(local_filename, "wb") as f:
+            f.write(content)
+        return True, None
+    except Exception as e: return False, str(e)
+
+# --- EXCEL HELPER ---
 
 def safe_write(ws, row, col, value):
-    cell = ws.cell(row=row, column=col)
-    if isinstance(cell, MergedCell):
-        for merged_range in ws.merged_cells.ranges:
-            if cell.coordinate in merged_range:
-                top_left = ws.cell(row=merged_range.min_row, column=merged_range.min_col)
-                top_left.value = value
-                break
-    else:
-        cell.value = value
-
-def generate_excel_bytes(template_file_id, datum, uhrzeit, ensemble, ort_data, songs_list):
-    template_stream, err = download_specific_template(template_file_id)
-    if err: return None, f"Download Fehler: {err}"
-
+    """Schreibt sicher in eine Zelle, auch wenn sie verbunden (merged) ist."""
     try:
-        wb = openpyxl.load_workbook(template_stream)
+        cell = ws.cell(row=row, column=col)
+        if isinstance(cell, MergedCell):
+            for merged_range in ws.merged_cells.ranges:
+                if cell.coordinate in merged_range:
+                    top_left = ws.cell(row=merged_range.min_row, column=merged_range.min_col)
+                    top_left.value = value
+                    break
+        else:
+            cell.value = value
+    except Exception:
+        pass # Ignoriere Schreibfehler in geschützte Bereiche
+
+def process_and_upload_excel(template_file_id, datum, uhrzeit, ensemble, ort_data, songs_list, target_filename):
+    # 1. Download Template lokal
+    local_temp = "temp_template.xlsx"
+    ok, err = download_specific_template(template_file_id, local_temp)
+    if not ok: return None, None, f"Download Fehler: {err}"
+
+    # 2. Excel bearbeiten
+    try:
+        wb = openpyxl.load_workbook(local_temp)
         ws = wb.active 
         
-        safe_write(ws, 1, 2, ensemble)
-        safe_write(ws, 2, 2, datum)
-        safe_write(ws, 3, 2, ort_data.get('Stadt', ''))
+        # --- KOPFZEILEN 1-20 ---
+        # User Wunsch: "Spalten A-Y, Zeilen 1-20 werden auf keinen Fall angerührt."
+        # Daher schreibe ich hier KEINE Header-Daten rein, um das Layout nicht zu zerstören.
         
-        start_row = 14
+        # --- LISTE AB ZEILE 21 ---
+        start_row = 21
         current_row = start_row
         
-        for row in ws.iter_rows(min_row=start_row, max_row=100):
-            for cell in row:
-                if not isinstance(cell, MergedCell): cell.value = None
+        # Leeren der alten Liste (nur sicherheitshalber bis Zeile 100)
+        # Wir löschen nur Inhalte in den relevanten Spalten, um Formeln nicht zu zerstören
+        cols_to_clear = [2, 5, 6, 7, 10, 16, 17] # B, E, F, G, J, P, Q
+        for r in range(start_row, 100):
+            for c in cols_to_clear:
+                safe_write(ws, r, c, None)
 
+        # Befüllen
         for song in songs_list:
+            # Titel -> B (2)
             safe_write(ws, current_row, 2, song['Titel'])
+            
+            # Dauer -> E (5)
             safe_write(ws, current_row, 5, song['Dauer'])
-            k_name = f"{song['Komponist_Nachname']}, {song['Komponist_Vorname']}"
-            safe_write(ws, current_row, 6, k_name)
-            if song['Bearbeiter_Nachname']:
-                b_name = f"{song['Bearbeiter_Nachname']}, {song['Bearbeiter_Vorname']}"
-                safe_write(ws, current_row, 16, b_name)
+            
+            # Komponist Nachname -> F (6)
+            safe_write(ws, current_row, 6, song['Komponist_Nachname'])
+            
+            # Komponist Vorname -> G (7)
+            safe_write(ws, current_row, 7, song['Komponist_Vorname'])
+            
+            # Verlag -> J (10)
             safe_write(ws, current_row, 10, song['Verlag'])
-            safe_write(ws, current_row, 11, "Live")
+            
+            # Bearbeiter Nachname -> P (16)
+            safe_write(ws, current_row, 16, song['Bearbeiter_Nachname'])
+            
+            # Bearbeiter Vorname -> Q (17)
+            safe_write(ws, current_row, 17, song['Bearbeiter_Vorname'])
+            
             current_row += 1
             
-        output = BytesIO()
-        wb.save(output)
-        output.seek(0)
-        return output, None
+        wb.save(target_filename)
+        
+        # Bytes für direkten Download vorbereiten
+        output_bytes = BytesIO()
+        with open(target_filename, "rb") as f:
+            output_bytes.write(f.read())
+        output_bytes.seek(0)
         
     except Exception as e:
-        return None, f"Excel Fehler: {e}"
+        return None, None, f"Excel Verarbeitungsfehler: {e}"
+
+    # 3. Upload in die Cloud (GEMA Bpol/Output)
+    web_link = "Lokal"
+    try:
+        # A) Hauptordner finden
+        root_id = get_folder_id("GEMA Bpol")
+        if root_id:
+            # B) Output Ordner finden oder erstellen
+            output_id = get_folder_id("Output", parent_id=root_id)
+            if not output_id:
+                # Versuchen zu erstellen (das darf der Bot, wenn er Schreibrechte auf GEMA Bpol hat)
+                file_metadata = {
+                    'name': 'Output',
+                    'mimeType': 'application/vnd.google-apps.folder',
+                    'parents': [root_id]
+                }
+                folder = drive_service.files().create(body=file_metadata, fields='id').execute()
+                output_id = folder.get('id')
+            
+            if output_id:
+                # C) Datei hochladen
+                file_metadata = {'name': target_filename, 'parents': [output_id]}
+                media = MediaFileUpload(target_filename, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+                
+                file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+                web_link = file.get('webViewLink')
+            else:
+                st.warning("Konnte Output-Ordner nicht erstellen/finden.")
+        else:
+            st.warning("Ordner 'GEMA Bpol' nicht gefunden. Speichere nur lokal.")
+
+    except Exception as e:
+        st.warning(f"Upload fehlgeschlagen (Quota oder Rechte): {e}")
+
+    # Aufräumen
+    if os.path.exists(local_temp): os.remove(local_temp)
+    if os.path.exists(target_filename): os.remove(target_filename)
+
+    return output_bytes, web_link, None
 
 # --- DB FUNKTIONEN ---
 def check_and_fix_db():
@@ -254,18 +339,28 @@ if st.session_state.page == "speichern":
     df_rep = get_data_repertoire()
     df_events = get_data_events()
     
-    # 1. DOWNLOAD BUTTON (bleibt jetzt stehen!)
+    # 1. DOWNLOAD & CLOUD STATUS
     if st.session_state.last_download:
         d_name, d_bytes = st.session_state.last_download
-        st.success("🎉 Datei fertig! Bitte herunterladen (Upload nicht möglich wegen Google Quota).")
-        st.download_button(
+        cloud_link = st.session_state.uploaded_file_link
+        
+        st.success("🎉 Verarbeitung abgeschlossen!")
+        c_dl, c_cloud = st.columns(2)
+        
+        c_dl.download_button(
             label=f"📥 {d_name} herunterladen",
             data=d_bytes,
             file_name=d_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary"
+            type="primary",
+            use_container_width=True
         )
-        st.info("ℹ️ Die Datei wurde lokal generiert. Du kannst sie jetzt manuell in dein Google Drive laden.")
+        
+        if cloud_link and cloud_link != "Lokal":
+            c_cloud.link_button("☁️ In Google Drive öffnen", cloud_link, use_container_width=True)
+        else:
+            c_cloud.info("Nur lokal gespeichert (kein Cloud-Upload).")
+            
         st.divider()
 
     # 2. Editier-Auswahl
@@ -297,7 +392,6 @@ if st.session_state.page == "speichern":
         # Zurück löscht auch den Download Button
         if cb.button("⬅️ Zurück"): 
             st.session_state.trigger_reset = True
-            st.session_state.last_download = None
             st.rerun()
         ch.header(f"✏️ Bearbeiten (ID: {st.session_state.gig_draft['event_id']})")
     else: st.header("📝 Neuen Auftritt erfassen")
@@ -319,11 +413,10 @@ if st.session_state.page == "speichern":
     if sel_loc == "➕ Neuer Ort...":
         with st.form("new_loc_form"):
             n = st.text_input("Name*"); s = st.text_input("Str."); p = st.text_input("PLZ"); ci = st.text_input("Stadt*")
-            # NEU: SOFORT SPEICHERN
             if st.form_submit_button("Bestätigen"):
                 if n and ci:
                     save_location_direct(n, s, p, ci)
-                    st.session_state.gig_draft["location_selection"] = n # Auto-Select
+                    st.session_state.gig_draft["location_selection"] = n # Auto select new location
                     st.toast(f"Ort '{n}' gespeichert!", icon="✅")
                     time.sleep(1)
                     st.rerun()
@@ -363,40 +456,54 @@ if st.session_state.page == "speichern":
             if not final_loc.get("Name") or not selection or not selected_template_id:
                 st.error("Daten fehlen! (Ort, Programm oder Template)")
             else:
-                datum_str = st.session_state.gig_draft["datum"].strftime("%d.%m.%Y")
-                time_str = st.session_state.gig_draft["uhrzeit"].strftime("%H:%M")
-                dateiname = f"{st.session_state.gig_draft['ensemble']}{datum_str}{final_loc['Stadt']}Setlist.xlsx"
-                
-                selected_songs_data = []
-                song_ids = []
-                for label in selection:
-                    row = df_rep[df_rep['Label'] == label].iloc[0]
-                    song_ids.append(str(row['ID']))
-                    selected_songs_data.append(row.to_dict())
-                
-                with st.spinner("Erstelle Excel-Datei..."):
-                    excel_bytes, err = generate_excel_bytes(selected_template_id, datum_str, time_str, st.session_state.gig_draft['ensemble'], final_loc, selected_songs_data)
+                # 1. Ort ggf. speichern (Doppelt hält besser falls User nicht Bestätigen klickte)
+                if sel_loc == "➕ Neuer Ort...":
+                    # Hier können wir nicht viel tun außer Fehler werfen, da User oben bestätigen muss
+                    st.error("Bitte erst den neuen Ort bestätigen!")
+                else:
+                    datum_str = st.session_state.gig_draft["datum"].strftime("%d.%m.%Y")
+                    time_str = st.session_state.gig_draft["uhrzeit"].strftime("%H:%M")
+                    dateiname = f"{st.session_state.gig_draft['ensemble']}{datum_str}{final_loc['Stadt']}Setlist.xlsx"
                     
-                    if err:
-                        st.error(f"⚠️ {err}")
-                    else:
-                        row_data = [
-                            datum_str, time_str, st.session_state.gig_draft["ensemble"],
-                            final_loc["Name"], final_loc["Strasse"], str(final_loc["PLZ"]), final_loc["Stadt"],
-                            dateiname, ",".join(song_ids), "Lokal"
-                        ]
+                    selected_songs_data = []
+                    song_ids = []
+                    for label in selection:
+                        row = df_rep[df_rep['Label'] == label].iloc[0]
+                        song_ids.append(str(row['ID']))
+                        selected_songs_data.append(row.to_dict())
+                    
+                    with st.spinner("Erstelle Excel-Datei und lade hoch..."):
+                        excel_bytes, web_link, err = process_and_upload_excel(
+                            selected_template_id, 
+                            datum_str, 
+                            time_str, 
+                            st.session_state.gig_draft['ensemble'], 
+                            final_loc, 
+                            selected_songs_data, 
+                            dateiname
+                        )
                         
-                        if st.session_state.gig_draft["event_id"]: update_event_in_db(st.session_state.gig_draft["event_id"], row_data)
+                        if err:
+                            st.error(f"⚠️ {err}")
                         else:
-                            ws_ev = sh.worksheet("Events"); col_ids = ws_ev.col_values(1)[1:]
-                            e_ids = [int(x) for x in col_ids if str(x).isdigit()]
-                            new_ev_id = max(e_ids) + 1 if e_ids else 1
-                            ws_ev.append_row([new_ev_id] + row_data)
-                            clear_all_caches()
-                        
-                        st.session_state.last_download = (dateiname, excel_bytes.getvalue())
-                        st.session_state.trigger_reset = True
-                        st.rerun()
+                            row_data = [
+                                datum_str, time_str, st.session_state.gig_draft["ensemble"],
+                                final_loc["Name"], final_loc["Strasse"], str(final_loc["PLZ"]), final_loc["Stadt"],
+                                dateiname, ",".join(song_ids), str(web_link)
+                            ]
+                            
+                            if st.session_state.gig_draft["event_id"]: update_event_in_db(st.session_state.gig_draft["event_id"], row_data)
+                            else:
+                                ws_ev = sh.worksheet("Events"); col_ids = ws_ev.col_values(1)[1:]
+                                e_ids = [int(x) for x in col_ids if str(x).isdigit()]
+                                new_ev_id = max(e_ids) + 1 if e_ids else 1
+                                ws_ev.append_row([new_ev_id] + row_data)
+                                clear_all_caches()
+                            
+                            st.session_state.last_download = (dateiname, excel_bytes.getvalue())
+                            st.session_state.uploaded_file_link = web_link
+                            st.session_state.trigger_reset = True
+                            st.rerun()
     else: st.warning("Repertoire leer.")
 
 # === SEITE 2,3,4 (Gleich) ===
@@ -441,5 +548,9 @@ elif st.session_state.page == "archiv":
                     for _, row in df_y[df_y['Datum_Obj'].dt.month == m].iterrows():
                         c1, c2 = st.columns([3, 1])
                         c1.write(f"**{row['Datum']}** | {row['Location_Name']} ({row['Ensemble']})"); c1.caption(f"Datei: {row['Setlist_Name']}")
-                        c2.caption("Lokal gespeichert")
+                        
+                        if 'File_Link' in row and row['File_Link'] and row['File_Link'] != "Lokal":
+                            c2.link_button("☁️ Drive", row['File_Link'])
+                        else:
+                            c2.caption("Nur Lokal")
                         st.divider()
