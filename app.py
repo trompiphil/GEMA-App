@@ -9,6 +9,7 @@ import time
 import os
 import openpyxl
 from openpyxl.cell.cell import MergedCell
+from openpyxl.styles import Font, Color # Für die roten Sternchen
 from io import BytesIO
 
 # --- KONFIGURATION ---
@@ -16,7 +17,7 @@ DB_NAME = "GEMA_Datenbank"
 
 st.set_page_config(page_title="GEMA Manager", page_icon="xj", layout="centered")
 
-# --- 1. SESSION STATE & NAVIGATION (JETZT GANZ OBEN) ---
+# --- INITIALISIERUNG & RESET-LOGIK ---
 
 def reset_draft_logic(keep_download=False):
     """Setzt das Formular zurück."""
@@ -31,7 +32,6 @@ def reset_draft_logic(keep_download=False):
         st.session_state.last_download = None
         st.session_state.uploaded_file_link = None
 
-# Variablen initialisieren
 if 'gig_draft' not in st.session_state: reset_draft_logic()
 if 'gig_song_selector' not in st.session_state: st.session_state.gig_song_selector = []
 if 'rep_edit_state' not in st.session_state: st.session_state.rep_edit_state = {"id": None, "titel": "", "dauer": "", "kn": "", "kv": "", "bn": "", "bv": "", "verlag": ""}
@@ -41,13 +41,12 @@ if 'last_download' not in st.session_state: st.session_state.last_download = Non
 if 'uploaded_file_link' not in st.session_state: st.session_state.uploaded_file_link = None
 if 'trigger_reset' not in st.session_state: st.session_state.trigger_reset = False
 
-# Reset Trigger
 if st.session_state.trigger_reset:
     reset_draft_logic(keep_download=True)
     st.session_state.trigger_reset = False
     st.rerun()
 
-# DEFINITION DER NAVIGATION (Hier oben ist sie sicher!)
+# --- NAVIGATION ---
 def navigation_bar():
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
@@ -60,8 +59,6 @@ def navigation_bar():
     if c4.button("📂 Archiv", use_container_width=True, type="primary" if st.session_state.page == "archiv" else "secondary"): 
         st.session_state.page = "archiv"; st.rerun()
     st.markdown("---")
-
-# --- 2. GOOGLE DIENSTE ---
 
 @st.cache_resource
 def get_gspread_client():
@@ -78,7 +75,7 @@ try:
 except Exception as e:
     st.error(f"Verbindungsfehler: {e}"); st.stop()
 
-# --- 3. HELPER FUNKTIONEN (DRIVE & EXCEL) ---
+# --- HELPER FUNKTIONEN ---
 
 def get_folder_id(folder_name, parent_id=None):
     query = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -94,7 +91,7 @@ def list_files_in_templates():
     root_id = get_folder_id("GEMA Bpol")
     if not root_id: return [], "Hauptordner 'GEMA Bpol' nicht gefunden."
     fid = get_folder_id("Templates", parent_id=root_id)
-    if not fid: fid = get_folder_id("Templates") 
+    if not fid: fid = get_folder_id("Templates")
     if not fid: return [], "Ordner 'Templates' nicht gefunden."
     
     query = f"'{fid}' in parents and trashed = false"
@@ -108,8 +105,9 @@ def download_specific_template(file_id, local_filename):
         return True, None
     except Exception as e: return False, str(e)
 
+# --- EXCEL HELPER ---
+
 def safe_write(ws, row, col, value):
-    """Schreibt in Zelle, ignoriert MergedCell Fehler"""
     try:
         cell = ws.cell(row=row, column=col)
         if isinstance(cell, MergedCell):
@@ -119,23 +117,53 @@ def safe_write(ws, row, col, value):
         else: cell.value = value
     except: pass
 
+def repair_red_stars(ws):
+    """
+    Malt die Sternchen in den Zeilen 19/20 wieder rot an.
+    Betroffene Zellen laut User: B, D, F, G, K, L in Zeilen 19 & 20
+    """
+    red_font = Font(color="FF0000", bold=True) # Rot und Fett
+    
+    # Spalten-Indices (B=2, D=4, F=6, G=7, K=11, L=12)
+    target_cols = [2, 4, 6, 7, 11, 12] 
+    target_rows = [19, 20]
+    
+    for r in target_rows:
+        for c in target_cols:
+            try:
+                # Wir holen die Zelle. Wenn Merged, müssen wir den "Chef" finden
+                cell = ws.cell(row=r, column=c)
+                if isinstance(cell, MergedCell):
+                    for rng in ws.merged_cells.ranges:
+                        if cell.coordinate in rng:
+                            cell = ws.cell(rng.min_row, rng.min_col)
+                            break
+                
+                # Wir färben den Text in der Zelle rot
+                # ACHTUNG: Das färbt den GANZEN Text in der Zelle rot.
+                # Wenn da steht "Titel *", wird alles rot. 
+                # Das ist der Kompromiss, da "RichText" (nur das Sternchen rot) sehr komplex ist.
+                if cell.value:
+                    cell.font = red_font
+            except:
+                pass
+
 def process_and_upload_excel(template_file_id, datum, uhrzeit, ensemble, ort_data, songs_list, target_filename):
-    # 1. Download
     local_temp = "temp_template.xlsx"
     ok, err = download_specific_template(template_file_id, local_temp)
     if not ok: return None, None, f"Download Fehler: {err}"
 
-    # 2. Excel bearbeiten
     try:
         wb = openpyxl.load_workbook(local_temp)
         ws = wb.active 
         
-        # Header NICHT anfassen (Zeile 1-20 geschützt)
+        # Zeilen 1-20 lassen wir in Ruhe (Header Daten werden nicht geschrieben um Layout zu schützen)
+        
         start_row = 21
         current_row = start_row
         
         # Leeren ab Zeile 21
-        cols = [2, 5, 6, 7, 10, 16, 17] # B,E,F,G,J,P,Q
+        cols = [2, 5, 6, 7, 10, 16, 17]
         for r in range(start_row, 100):
             for c in cols: safe_write(ws, r, c, None)
 
@@ -149,6 +177,9 @@ def process_and_upload_excel(template_file_id, datum, uhrzeit, ensemble, ort_dat
             safe_write(ws, current_row, 16, song['Bearbeiter_Nachname']) 
             safe_write(ws, current_row, 17, song['Bearbeiter_Vorname']) 
             current_row += 1
+        
+        # --- DIE LACKIEREREI: Sternchen rot machen ---
+        repair_red_stars(ws)
             
         wb.save(target_filename)
         
@@ -159,8 +190,8 @@ def process_and_upload_excel(template_file_id, datum, uhrzeit, ensemble, ort_dat
     except Exception as e:
         return None, None, f"Excel Fehler: {e}"
 
-    # 3. Upload (Safe Mode)
-    web_link = "Lokal"
+    # Upload Versuch (mit 'supportsAllDrives' Hack)
+    web_link = "Lokal (Upload Limit)"
     try:
         root_id = get_folder_id("GEMA Bpol")
         if root_id:
@@ -168,18 +199,24 @@ def process_and_upload_excel(template_file_id, datum, uhrzeit, ensemble, ort_dat
             if output_id:
                 file_metadata = {'name': target_filename, 'parents': [output_id]}
                 media = MediaFileUpload(target_filename, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-                file = drive_service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+                
+                # supportsAllDrives=True hilft manchmal bei Quota Problemen
+                file = drive_service.files().create(
+                    body=file_metadata, 
+                    media_body=media, 
+                    fields='id, webViewLink',
+                    supportsAllDrives=True 
+                ).execute()
                 web_link = file.get('webViewLink')
     except Exception:
-        web_link = "Upload gescheitert (Quota)" # Fehler abfangen, nicht abstürzen
+        pass # Fehler ignorieren, Download Button ist da
 
     if os.path.exists(local_temp): os.remove(local_temp)
     if os.path.exists(target_filename): os.remove(target_filename)
 
     return output_bytes, web_link, None
 
-# --- 4. DB FUNKTIONEN ---
-
+# --- DB & CACHE ---
 def check_and_fix_db():
     if st.session_state.db_checked: return
     try: 
@@ -254,16 +291,15 @@ def update_event_in_db(eid, data):
         clear_all_caches(); return True
     except: return False
 
-# --- 5. APP UI (MAIN) ---
+# --- UI (MAIN) ---
 
 check_and_fix_db()
 st.title("Orchester Manager 🎻")
-navigation_bar() # Jetzt sicher aufrufbar!
+navigation_bar()
 
 if st.session_state.page == "speichern":
     df_loc = get_data_locations(); df_rep = get_data_repertoire(); df_events = get_data_events()
     
-    # Download Button
     if st.session_state.last_download:
         d_name, d_bytes = st.session_state.last_download
         cloud_stat = st.session_state.uploaded_file_link
@@ -271,10 +307,9 @@ if st.session_state.page == "speichern":
         c1, c2 = st.columns(2)
         c1.download_button(f"📥 {d_name}", d_bytes, d_name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
         if "http" in str(cloud_stat): c2.link_button("☁️ Drive Link", cloud_stat, use_container_width=True)
-        else: c2.warning("⚠️ Cloud Upload voll. Lokal speichern.")
+        else: c2.info("⚠️ Cloud-Upload technisch nicht möglich (Google Quota). Bitte lokal speichern.")
         st.divider()
 
-    # Editier-Auswahl
     if not st.session_state.gig_draft["event_id"]:
         with st.expander("🛠 Bearbeiten"):
             if not df_events.empty:
@@ -287,7 +322,6 @@ if st.session_state.page == "speichern":
                     st.session_state.gig_song_selector = df_rep[df_rep['ID'].isin(ids)]['Label'].tolist() if not df_rep.empty else []
                     st.session_state.last_download = None; st.rerun()
 
-    # Formular
     if st.session_state.gig_draft["event_id"]:
         if st.button("⬅️ Zurück"): 
             st.session_state.trigger_reset = True; st.rerun()
@@ -335,7 +369,6 @@ if st.session_state.page == "speichern":
         sel_songs = st.multiselect("Suche", df_rep['Label'].tolist(), key="gig_song_selector")
         st.markdown("---")
         
-        # Template Wahl
         files, err = list_files_in_templates()
         if not files: st.error(err if err else "Keine Templates gefunden")
         else:
@@ -376,6 +409,7 @@ if st.session_state.page == "speichern":
                             st.session_state.uploaded_file_link = link
                             st.session_state.trigger_reset = True
                             st.rerun()
+    else: st.warning("Repertoire leer.")
 
 # --- ANDERE SEITEN ---
 elif st.session_state.page == "repertoire":
@@ -420,6 +454,6 @@ elif st.session_state.page == "archiv":
                 with st.expander(f"{mn} ({len(dfy[dfy['Datum_Obj'].dt.month==m])})"):
                     for _,r in dfy[dfy['Datum_Obj'].dt.month==m].iterrows():
                         st.write(f"**{r['Datum']}** | {r['Location_Name']}"); st.caption(r['Setlist_Name'])
-                        if "http" in str(r.get('File_Link','')): st.link_button("☁️ Cloud", r['File_Link'])
+                        if "http" in str(r.get('File_Link','')): st.link_button("☁️ Drive", r['File_Link'])
                         else: st.caption("Lokal")
                         st.divider()
